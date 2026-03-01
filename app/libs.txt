@@ -1,0 +1,13 @@
+Pillow>=9.0.0
+gradio==6.5.1
+opencv-python==4.6.0.66
+faster-whisper==1.2.1
+sounddevice
+numpy==1.26.4
+paddlepaddle==2.6.2
+paddleocr==2.7.0.3
+vietocr
+torch
+torchvision
+torchaudio
+timm
