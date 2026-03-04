@@ -1,13 +1,24 @@
-Pillow>=9.0.0
-gradio==6.5.1
-opencv-python==4.6.0.66
-faster-whisper==1.2.1
-sounddevice
+# ===== CORE NUMPY (ABI SAFE) =====
 numpy==1.26.4
+
+# ===== IMAGE PROCESSING =====
+opencv-python==4.6.0.66
+Pillow==10.2.0
+
+# ===== OCR =====
 paddlepaddle==2.6.2
 paddleocr==2.7.0.3
-vietocr
-torch
-torchvision
-torchaudio
-timm
+vietocr==0.3.11
+
+# ===== TORCH STACK (CPU - Python 3.10 SAFE) =====
+torch==2.2.2
+torchvision==0.17.2
+torchaudio==2.2.2
+timm==0.9.16
+
+# ===== AUDIO =====
+sounddevice==0.4.6
+faster-whisper==1.0.3
+
+# ===== UI (OPTIONAL) =====
+gradio==4.31.5
