@@ -1,6 +1,6 @@
 import numpy as np
 from PIL import ImageOps
-from app.services.extractor.image.pre_processing import blur_image, resize
+from services.extractor.image.pre_processing import blur_image, resize
 
 
 class OCRPipeline:

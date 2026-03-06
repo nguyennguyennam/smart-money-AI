@@ -1,7 +1,7 @@
 from fastapi import APIRouter, UploadFile, File, Form
-from app.core.enums import InputType
-from app.services.extractor.context import Context
-from app.schemas.response import Response
+from core.enums import InputType
+from services.extractor.context import Context
+from schemas.response import Response
 
 router = APIRouter()
 context = Context()

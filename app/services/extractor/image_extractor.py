@@ -1,7 +1,7 @@
 from fastapi import UploadFile
 from .base import BaseExtractor
-from app.models.ocr_model import OCRModel
-from app.pipeline.ocr_pipeline import OCRPipeline
+from models.ocr_model import OCRModel
+from pipeline.ocr_pipeline import OCRPipeline
 from PIL import Image
 import asyncio
 import io
