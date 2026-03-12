@@ -10,7 +10,7 @@ venv/
 .paddleocr/
 *.pth
 *.pd*
-
+.venv
 uploads/
 output/
 inference_results/
