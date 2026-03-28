@@ -22,3 +22,12 @@ faster-whisper==1.0.3
 
 # ===== UI (OPTIONAL) =====
 gradio==4.31.5
+
+# ===== API =====
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
+
+# ===== CLASSIFIER =====
+# model.pkl was pickled with scikit-learn 1.7.x; pinning avoids version warnings.
+scikit-learn==1.7.0
