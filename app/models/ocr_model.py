@@ -2,8 +2,13 @@ import os
 import numpy as np
 from PIL import Image
 from paddleocr import PaddleOCR
-from vietocr.tool.predictor import Predictor
-from vietocr.tool.config import Cfg
+
+
+def _ensure_pillow_antialias() -> None:
+    # Pillow 10 removed Image.ANTIALIAS; VietOCR versions still reference it.
+    # Define it as an alias to the modern resampling enum.
+    if not hasattr(Image, "ANTIALIAS") and hasattr(Image, "Resampling"):
+        Image.ANTIALIAS = Image.Resampling.LANCZOS  # type: ignore[attr-defined]
 
 
 class OCRModel:
@@ -12,6 +17,12 @@ class OCRModel:
         print("Loading OCR models...")
         os.environ["FLAGS_use_pir_api"] = "0"
         os.environ["FLAGS_use_mkldnn"] = "1"
+
+        _ensure_pillow_antialias()
+
+        # Local imports keep this module compatible with Pillow>=10.
+        from vietocr.tool.predictor import Predictor
+        from vietocr.tool.config import Cfg
 
         # Detector
         self.detector = PaddleOCR(

@@ -14,9 +14,17 @@ class ImageExtractor(BaseExtractor):
         self.pipeline = OCRPipeline(self.model)
 
     async def extract(self, file: UploadFile):
-        content = await file.read()  
-        img = Image.open(io.BytesIO(content))
+        content = await file.read()
+        return await self.extract_bytes(content)
+
+    async def extract_bytes(self, content: bytes):
+        if not content:
+            return {"error": "Empty file", "text": ""}
+
+        try:
+            img = Image.open(io.BytesIO(content))
+        except Exception:
+            return {"error": "Invalid image", "text": ""}
 
         result = await asyncio.to_thread(self.pipeline.run, img)
-
         return result
