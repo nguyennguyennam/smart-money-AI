@@ -80,13 +80,13 @@ def _decode_stream_fields(fields: dict[Any, Any]) -> dict[str, str]:
 
 def _parse_job(fields: dict[str, str]) -> JobEvent:
     job_id = fields.get("jobId") or fields.get("job_id")
-    file_url = fields.get("fileUrl") or fields.get("file_url")
+    file_url = fields.get("data") or fields.get("file_url")
     duty = fields.get("duty")
 
     if not job_id:
         raise ValueError("Missing jobId")
     if not file_url:
-        raise ValueError("Missing fileUrl")
+        raise ValueError("Missing data")
     if not duty:
         raise ValueError("Missing duty")
 

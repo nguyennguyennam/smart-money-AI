@@ -49,10 +49,10 @@ python -m app.services.worker
 
 ## Quick smoke test
 
-Add a job to the stream (fields must include `jobId`, `userId`, `fileUrl`, `duty`, `createdAt`):
+Add a job to the stream (fields must include `jobId`, `userId`, `data`, `duty`, `createdAt`):
 
 ```bash
-redis-cli -u "$REDIS_STREAM_URL" XADD stream:jobs:0 \* jobId 1 userId u1 fileUrl "https://..." duty ocr createdAt "2026-03-30T00:00:00Z"
+redis-cli -u "$REDIS_STREAM_URL" XADD stream:jobs:0 \* jobId 1 userId u1 data "https://..." duty ocr createdAt "2026-03-30T00:00:00Z"
 ```
 
 Then check the result key in result Redis:

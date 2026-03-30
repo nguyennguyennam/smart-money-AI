@@ -16,7 +16,7 @@ class FetchResult:
 class CloudinaryFetcher:
     async def fetch(self, url: str) -> FetchResult:
         if not url or not isinstance(url, str):
-            raise ValueError("fileUrl is required")
+            raise ValueError("data is required")
 
         timeout = httpx.Timeout(settings.DOWNLOAD_TIMEOUT_SECONDS)
         limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
