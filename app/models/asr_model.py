@@ -1,65 +1,106 @@
+"""ASR model wrapper.
+
+This project previously used `faster-whisper` directly. To use PhoWhisper
+(Vietnamese fine-tuned Whisper), we load it from HuggingFace using
+`transformers`.
+
+Contract: `transcribe()` returns an iterable of objects with a `.text` attribute
+so existing pipeline code can join segment texts.
+"""
+
 from __future__ import annotations
 
-import os
-import tempfile
-from functools import lru_cache
+from dataclasses import dataclass
+from typing import Iterable, List, Optional
+
+import numpy as np
 
 from app.core.config import settings
 
 
+@dataclass(frozen=True)
+class ASRSegment:
+   text: str
+
+
 class ASRModel:
-	def __init__(self):
-		# faster-whisper model sizes: tiny/base/small/medium/large-v3, or local path.
-		# This repo historically uses "whisper" as a placeholder; map it to a valid default.
-		model_name = (settings.ASR_MODEL_NAME or "").strip()
-		if model_name.lower() == "whisper":
-			model_name = "base"
+   def __init__(self) -> None:
+      print("Loading ASR Model (PhoWhisper)...")
 
-		try:
-			# Import lazily so environments without working ctranslate2 can still run OCR jobs.
-			from faster_whisper import WhisperModel  # type: ignore
+      try:
+         import torch
+         from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+      except Exception as e:  # pragma: no cover
+         raise ImportError(
+            "Missing ASR dependencies. Install with: pip install -r app/libs.txt "
+            "(requires 'transformers' and 'torch')."
+         ) from e
 
-			self._model = WhisperModel(
-				model_name,
-				device=settings.ASR_DEVICE,
-				compute_type=settings.ASR_COMPUTE_TYPE,
-			)
-		except Exception as e:
-			raise RuntimeError(
-				"ASR backend failed to initialize (faster-whisper/ctranslate2). "
-				"On Windows this is commonly caused by missing VC++ runtime or an incompatible CPU instruction set. "
-				"OCR jobs can still run; voice jobs will fail until ASR is fixed. "
-				f"Original error: {e}"
-			) from e
+      model_id = (settings.ASR_MODEL_NAME or "vinai/PhoWhisper-small").strip()
 
-	def transcribe_file(self, file_path: str) -> str:
-		segments, _info = self._model.transcribe(file_path)
-		parts: list[str] = []
-		for seg in segments:
-			text = (seg.text or "").strip()
-			if text:
-				parts.append(text)
-		return " ".join(parts).strip()
+      want_device = (settings.ASR_DEVICE or "cpu").strip().lower()
+      if want_device == "cuda" and torch.cuda.is_available():
+         self.device = torch.device("cuda")
+      else:
+         self.device = torch.device("cpu")
 
-	def transcribe_bytes(self, audio_bytes: bytes, suffix: str = ".audio") -> str:
-		if not audio_bytes:
-			return ""
+      compute_type = (settings.ASR_COMPUTE_TYPE or "float32").strip().lower()
+      if self.device.type == "cuda" and compute_type in {"float16", "fp16"}:
+         torch_dtype = torch.float16
+      else:
+         torch_dtype = torch.float32
 
-		tmp_path = ""
-		try:
-			with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-				f.write(audio_bytes)
-				tmp_path = f.name
-			return self.transcribe_file(tmp_path)
-		finally:
-			if tmp_path:
-				try:
-					os.remove(tmp_path)
-				except OSError:
-					pass
+      self._input_dtype = torch_dtype if self.device.type == "cuda" else torch.float32
 
+      self.processor = AutoProcessor.from_pretrained(model_id)
+      self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
+         model_id,
+         torch_dtype=torch_dtype,
+      )
+      self.model.to(self.device)
+      self.model.eval()
 
-@lru_cache(maxsize=1)
-def get_asr_model() -> ASRModel:
-	return ASRModel()
+      self._forced_decoder_ids: Optional[list[list[int]]] = None
+      try:
+         # Whisper-style processor supports this; keep best-effort.
+         self._forced_decoder_ids = self.processor.get_decoder_prompt_ids(
+            language="vi", task="transcribe"
+         )
+      except Exception:
+         self._forced_decoder_ids = None
 
+      print(f"ASR Model loaded: {model_id} on {self.device.type}")
+
+   def transcribe(self, audio: object) -> Iterable[ASRSegment]:
+      import torch
+
+      if audio is None:
+         return []
+
+      audio_array = np.asarray(audio)
+      if audio_array.ndim != 1:
+         audio_array = np.squeeze(audio_array)
+      if audio_array.ndim != 1:
+         raise ValueError("Audio must be a 1-D mono waveform array")
+
+      audio_array = audio_array.astype(np.float32, copy=False)
+
+      inputs = self.processor(audio_array, sampling_rate=16000, return_tensors="pt")
+      inputs = {
+         k: (v.to(self.device, dtype=self._input_dtype) if torch.is_floating_point(v) else v.to(self.device))
+         for k, v in inputs.items()
+      }
+
+      gen_kwargs = {}
+      if self._forced_decoder_ids is not None:
+         gen_kwargs["forced_decoder_ids"] = self._forced_decoder_ids
+
+      with torch.inference_mode():
+         predicted_ids = self.model.generate(**inputs, **gen_kwargs)
+
+      text = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
+      if not text:
+         return []
+      return [ASRSegment(text=text)]
+
+   

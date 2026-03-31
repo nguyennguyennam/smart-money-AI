@@ -14,10 +14,10 @@ class Settings(BaseSettings):
 
     # Models
     OCR_MODEL_NAME: str = "pytesseract"
-    # Name/path for faster-whisper model (e.g. "base", "small", or a local path)
-    ASR_MODEL_NAME: str = "whisper"
+    # HuggingFace model id/path for ASR (default: PhoWhisper for Vietnamese)
+    ASR_MODEL_NAME: str = "vinai/PhoWhisper-small"
     ASR_DEVICE: str = "cpu"  # cpu | cuda
-    ASR_COMPUTE_TYPE: str = "int8"  # int8 | float16 | float32
+    ASR_COMPUTE_TYPE: str = "float32"  # float16 | float32 (float16 only when ASR_DEVICE=cuda)
 
     # Redis (input stream)
     # Example: redis://localhost:6379/0

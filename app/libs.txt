@@ -1,6 +1,10 @@
 # ===== CORE NUMPY (ABI SAFE) =====
 numpy==1.26.4
 
+# Needed by some third-party libs (e.g., gdown -> pkg_resources)
+# Note: in this environment, newer setuptools builds lacked pkg_resources.
+setuptools==70.3.0
+
 # ===== IMAGE PROCESSING =====
 opencv-python==4.6.0.66
 Pillow==10.2.0
@@ -9,6 +13,8 @@ Pillow==10.2.0
 paddlepaddle==2.6.2
 paddleocr==2.7.0.3
 vietocr==0.3.11
+# VietOCR 0.3.11 pins gdown==4.4.0
+gdown==4.4.0
 
 # ===== TORCH STACK (CPU - Python 3.10 SAFE) =====
 torch==2.2.2
@@ -16,9 +22,19 @@ torchvision==0.17.2
 torchaudio==2.2.2
 timm==0.9.16
 
+# ===== TRANSFORMERS (ASR: PhoWhisper) =====
+transformers==4.41.2
+
 # ===== AUDIO =====
 sounddevice==0.4.6
 faster-whisper==1.0.3
+
+# Faster-Whisper native/runtime deps (explicit for reproducible installs on Windows)
+ctranslate2==4.7.1
+av>=11.0.0
+
+# Optional (used by app/services/extractor/voice/noise_reduce.py)
+noisereduce>=3.0.0
 
 # ===== UI (OPTIONAL) =====
 gradio==4.31.5

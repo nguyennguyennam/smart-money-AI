@@ -13,9 +13,6 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 
 from app.core.config import settings
-from app.services.classifer.classifier import get_classifier_service
-from app.services.extractor.image_extractor import ImageExtractor
-from app.services.extractor.voice_extractor import VoiceExtractor
 from app.services.fetcher.cloudinary_fetcher import get_cloudinary_fetcher
 
 logger = logging.getLogger(__name__)
@@ -80,7 +77,7 @@ def _decode_stream_fields(fields: dict[Any, Any]) -> dict[str, str]:
 
 def _parse_job(fields: dict[str, str]) -> JobEvent:
     job_id = fields.get("jobId") or fields.get("job_id")
-    file_url = fields.get("data") or fields.get("file_url")
+    file_url = fields.get("data") or fields.get("data")
     duty = fields.get("duty")
 
     if not job_id:
@@ -246,8 +243,8 @@ async def _process_one(
     result_redis: redis.Redis,
     fetcher,
     classifier,
-    image_extractor: ImageExtractor,
-    voice_extractor: VoiceExtractor,
+    image_extractor,
+    voice_extractor,
     stream_key: str,
     group: str,
     message_id: str,
@@ -265,7 +262,7 @@ async def _process_one(
         extracted_text = str(ocr_result.get("text") or "")
 
     elif job.duty.lower() == "voice":
-        asr_result = await voice_extractor.extract_bytes(download.content)
+        asr_result = await voice_extractor.extract_bytes(download.content, content_type=download.content_type)
         if asr_result.get("error"):
             raise RuntimeError(str(asr_result.get("error")))
         extracted_text = str(asr_result.get("text") or "")
@@ -316,9 +313,18 @@ async def run_worker_forever() -> None:
     input_redis, result_redis = await connect()
 
     fetcher = get_cloudinary_fetcher()
+
+    # Important on Windows: load Faster-Whisper/CTranslate2 before OCR/classifier
+    # to avoid native DLL/OpenMP runtime conflicts (WinError 127).
+    from app.services.extractor.voice_extractor import VoiceExtractor
+
+    voice_extractor = VoiceExtractor()  # preloads ASR model at worker startup
+
+    from app.services.classifer.classifier import get_classifier_service
+    from app.services.extractor.image_extractor import ImageExtractor
+
     classifier = get_classifier_service()
     image_extractor = ImageExtractor()
-    voice_extractor = VoiceExtractor()
 
     logger.info(
         "Worker started. stream=%s group=%s consumer=%s",
