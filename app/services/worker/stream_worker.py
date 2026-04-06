@@ -77,24 +77,39 @@ def _decode_stream_fields(fields: dict[Any, Any]) -> dict[str, str]:
 
 def _parse_job(fields: dict[str, str]) -> JobEvent:
     job_id = fields.get("jobId") or fields.get("job_id")
-    file_url = fields.get("data") or fields.get("data")
+    raw_data = fields.get("data")
     duty = fields.get("duty")
 
     if not job_id:
         raise ValueError("Missing jobId")
-    if not file_url:
+    if not raw_data:
         raise ValueError("Missing data")
     if not duty:
         raise ValueError("Missing duty")
 
+    # ✅ FIX: parse JSON nếu cần
+    file_url = raw_data
+
+    if raw_data.startswith("{"):
+        try:
+            parsed = json.loads(raw_data)
+            file_url = parsed.get("imageUrl")
+        except Exception:
+            raise ValueError(f"Invalid JSON data: {raw_data}")
+
+    # ✅ validate URL
+    if not file_url or not file_url.startswith("http"):
+        raise ValueError(f"Invalid file_url: {file_url}")
+
+    print(f"Parsed jobId={job_id} file_url={file_url} duty={duty}")
+
     return JobEvent(
         job_id=str(job_id),
         user_id=fields.get("userId") or fields.get("user_id"),
-        file_url=str(file_url),
+        file_url=file_url,
         duty=str(duty),
         created_at=fields.get("createdAt") or fields.get("created_at"),
     )
-
 
 async def _ensure_consumer_group(r: redis.Redis, stream_key: str, group: str) -> None:
     try:
@@ -279,12 +294,18 @@ async def _process_one(
         "category": classification.category.value,
         "confidence": classification.confidence,
     }
+    
+    await result_redis.xadd("result_stream", payload, maxlen=10000, approximate=True)
 
     ttl = int(settings.RESULT_TTL_SECONDS)
     if ttl > 0:
-        await result_redis.setex(result_key, ttl, json.dumps(payload, ensure_ascii=False))
+        await result_redis.setex(
+            result_key,
+            ttl,
+            json.dumps(payload)
+        )
     else:
-        await result_redis.set(result_key, json.dumps(payload, ensure_ascii=False))
+        await result_redis.set(result_key, json.dumps(payload))
 
     await input_redis.xack(stream_key, group, message_id)
 
