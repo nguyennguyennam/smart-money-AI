@@ -306,10 +306,10 @@ async def _process_one(
         await result_redis.setex(
             result_key,
             ttl,
-            json.dumps(payload)
+            json.dumps(payload, ensure_ascii=False),
         )
     else:
-        await result_redis.set(result_key, json.dumps(payload))
+        await result_redis.set(result_key, json.dumps(payload, ensure_ascii=False))
 
     await input_redis.xack(stream_key, group, message_id)
 
