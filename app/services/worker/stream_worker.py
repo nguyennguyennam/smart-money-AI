@@ -252,6 +252,8 @@ async def _dead_letter(
     }
     await r.xadd(dead_letter_stream_key, payload)
 
+def enhance_cloudinary_url(url: str) -> str:
+    return url.replace("/upload/", "/upload/q_100/")
 
 async def _process_one(
     input_redis: redis.Redis,
@@ -267,7 +269,9 @@ async def _process_one(
 ) -> None:
     job = _parse_job(fields)
 
-    download = await fetcher.fetch(job.file_url)
+    enhanced_url = enhance_cloudinary_url(job.file_url)    
+
+    download = await fetcher.fetch(enhanced_url)
 
     extracted_text = ""
     if job.duty.lower() == "ocr":
