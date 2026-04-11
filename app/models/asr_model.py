@@ -1,8 +1,9 @@
 """ASR model wrapper.
 
-This project previously used `faster-whisper` directly. To use PhoWhisper
-(Vietnamese fine-tuned Whisper), we load it from HuggingFace using
-`transformers`.
+This project uses the official `moonshine-voice` PyPI package (as demonstrated
+in `getting_started_with_moonshine_voice.ipynb`). This avoids relying on
+Transformers' model mappings, which may not yet include Moonshine streaming
+types in older versions.
 
 Contract: `transcribe()` returns an iterable of objects with a `.text` attribute
 so existing pipeline code can join segment texts.
@@ -11,7 +12,7 @@ so existing pipeline code can join segment texts.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from typing import Iterable
 
 import numpy as np
 
@@ -25,55 +26,36 @@ class ASRSegment:
 
 class ASRModel:
    def __init__(self) -> None:
-      print("Loading ASR Model (PhoWhisper)...")
+      print("Loading ASR Model (Moonshine Voice)...")
 
       try:
-         import torch
-         from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+         import moonshine_voice
       except Exception as e:  # pragma: no cover
          raise ImportError(
-            "Missing ASR dependencies. Install with: pip install -r app/libs.txt "
-            "(requires 'transformers' and 'torch')."
+            "Missing ASR dependency 'moonshine-voice'. Install with: pip install -r app/libs.txt"
          ) from e
 
-      model_id = (settings.ASR_MODEL_NAME or "vinai/PhoWhisper-small").strip()
+      # Primary control is via ASR_LANGUAGE (e.g., 'vi', 'en').
+      # For backwards compatibility, if ASR_MODEL_NAME looks like a language code,
+      # we accept it as an override.
+      lang = (getattr(settings, "ASR_LANGUAGE", None) or "").strip()
+      model_name = (getattr(settings, "ASR_MODEL_NAME", None) or "").strip()
+      if (not lang) and model_name and ("/" not in model_name) and ("\\" not in model_name) and (len(model_name) <= 10):
+         lang = model_name
+      if not lang:
+         lang = "en"
 
-      want_device = (settings.ASR_DEVICE or "cpu").strip().lower()
-      if want_device == "cuda" and torch.cuda.is_available():
-         self.device = torch.device("cuda")
-      else:
-         self.device = torch.device("cpu")
-
-      compute_type = (settings.ASR_COMPUTE_TYPE or "float32").strip().lower()
-      if self.device.type == "cuda" and compute_type in {"float16", "fp16"}:
-         torch_dtype = torch.float16
-      else:
-         torch_dtype = torch.float32
-
-      self._input_dtype = torch_dtype if self.device.type == "cuda" else torch.float32
-
-      self.processor = AutoProcessor.from_pretrained(model_id)
-      self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
-         model_id,
-         torch_dtype=torch_dtype,
+      self._moonshine_voice = moonshine_voice
+      self._language = lang
+      self._model_path, self._model_arch = moonshine_voice.get_model_for_language(lang)
+      self._transcriber = moonshine_voice.Transcriber(
+         model_path=self._model_path,
+         model_arch=self._model_arch,
       )
-      self.model.to(self.device)
-      self.model.eval()
 
-      self._forced_decoder_ids: Optional[list[list[int]]] = None
-      try:
-         # Whisper-style processor supports this; keep best-effort.
-         self._forced_decoder_ids = self.processor.get_decoder_prompt_ids(
-            language="vi", task="transcribe"
-         )
-      except Exception:
-         self._forced_decoder_ids = None
-
-      print(f"ASR Model loaded: {model_id} on {self.device.type}")
+      print(f"ASR Model loaded (moonshine-voice): lang={lang}")
 
    def transcribe(self, audio: object) -> Iterable[ASRSegment]:
-      import torch
-
       if audio is None:
          return []
 
@@ -85,20 +67,18 @@ class ASRModel:
 
       audio_array = audio_array.astype(np.float32, copy=False)
 
-      inputs = self.processor(audio_array, sampling_rate=16000, return_tensors="pt")
-      inputs = {
-         k: (v.to(self.device, dtype=self._input_dtype) if torch.is_floating_point(v) else v.to(self.device))
-         for k, v in inputs.items()
-      }
+      transcript = self._transcriber.transcribe_without_streaming(audio_array)
 
-      gen_kwargs = {}
-      if self._forced_decoder_ids is not None:
-         gen_kwargs["forced_decoder_ids"] = self._forced_decoder_ids
+      lines = getattr(transcript, "lines", None)
+      if isinstance(lines, list):
+         segments: list[ASRSegment] = []
+         for line in lines:
+            text = str(getattr(line, "text", "") or "").strip()
+            if text:
+               segments.append(ASRSegment(text=text))
+         return segments
 
-      with torch.inference_mode():
-         predicted_ids = self.model.generate(**inputs, **gen_kwargs)
-
-      text = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
+      text = str(getattr(transcript, "text", transcript) or "").strip()
       if not text:
          return []
       return [ASRSegment(text=text)]

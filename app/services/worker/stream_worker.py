@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import socket
 from dataclasses import dataclass
 from typing import Any
@@ -16,6 +17,100 @@ from app.core.config import settings
 from app.services.fetcher.cloudinary_fetcher import get_cloudinary_fetcher
 
 logger = logging.getLogger(__name__)
+
+
+_DEFAULT_EXPENSE_VND = 50_000
+_CATEGORY_LLM_FALLBACK_THRESHOLD = 0.25
+
+
+def _parse_expense_number(raw: str | None) -> int:
+    if not raw:
+        return _DEFAULT_EXPENSE_VND
+
+    s = str(raw).strip()
+    # Grab first number-like token (supports 1.234.567 or 1,234,567)
+    m = re.search(r"\d[\d\s.,]*\d|\d+", s)
+    if not m:
+        return _DEFAULT_EXPENSE_VND
+
+    token = m.group(0)
+    digits = re.sub(r"\D", "", token)
+    if not digits:
+        return _DEFAULT_EXPENSE_VND
+
+    try:
+        n = int(digits)
+    except Exception:
+        return _DEFAULT_EXPENSE_VND
+
+    return n if n > 0 else _DEFAULT_EXPENSE_VND
+
+
+async def _extract_expense_vnd(llm_service, bill_text_vi: str) -> int:
+    if not bill_text_vi or not isinstance(bill_text_vi, str):
+        return _DEFAULT_EXPENSE_VND
+
+    prompt = (
+        "Bạn là hệ thống trích xuất chi phí từ nội dung hóa đơn bằng tiếng Việt.\n"
+        "Hãy trả về DUY NHẤT một số nguyên (VND) đại diện cho tổng tiền phải trả.\n"
+        "Không giải thích, không thêm chữ, không thêm ký hiệu tiền tệ.\n"
+        "Nếu không chắc chắn hoặc không tìm thấy tổng tiền, hãy trả về 50000.\n\n"
+        "Nội dung hóa đơn:\n"
+        "```\n"
+        f"{bill_text_vi}\n"
+        "```\n"
+        "\nChỉ trả về một số:"
+    )
+
+    try:
+        out = await llm_service.generate(prompt=prompt, provider="gemini")
+    except Exception:
+        return _DEFAULT_EXPENSE_VND
+
+    return _parse_expense_number(out)
+
+
+async def _classify_category_with_llm(llm_service, text_vi: str) -> str | None:
+    if not text_vi or not isinstance(text_vi, str):
+        return None
+
+    # Import here to avoid pulling classifier deps at module import time.
+    from app.services.classifer.enums import CATEGORIES
+
+    categories = ", ".join(CATEGORIES)
+
+    prompt = (
+        "Bạn là hệ thống phân loại chi tiêu từ văn bản tiếng Việt.\n"
+        "Hãy trả về DUY NHẤT một nhãn danh mục từ danh sách cho phép.\n"
+        "Không giải thích, không thêm ký tự khác.\n"
+        "Nếu không chắc chắn, trả về OTHER.\n\n"
+        f"Danh mục cho phép: {categories}\n\n"
+        "Văn bản:\n"
+        "```\n"
+        f"{text_vi}\n"
+        "```\n\n"
+        "Chỉ trả về một nhãn danh mục:" 
+    )
+
+    try:
+        out = await llm_service.generate(prompt=prompt, provider="gemini")
+    except Exception:
+        return None
+
+    if not out:
+        return None
+
+    out_norm = str(out).strip().upper()
+    # Try exact match first
+    if out_norm in CATEGORIES:
+        return out_norm
+
+    # Fallback: find any allowed token inside the response
+    for c in CATEGORIES:
+        if re.search(rf"\b{re.escape(c)}\b", out_norm):
+            return c
+
+    return None
 
 
 def _redis_from_url_checked(url: str, label: str) -> redis.Redis:
@@ -262,6 +357,7 @@ async def _process_one(
     classifier,
     image_extractor,
     voice_extractor,
+    llm_service,
     stream_key: str,
     group: str,
     message_id: str,
@@ -289,15 +385,26 @@ async def _process_one(
     else:
         raise ValueError(f"Unsupported duty: {job.duty}")
 
+    expense = await _extract_expense_vnd(llm_service, extracted_text)
+
     classification = classifier.classify(extracted_text)
+
+    final_category = classification.category.value
+    if float(classification.confidence) < _CATEGORY_LLM_FALLBACK_THRESHOLD:
+        llm_category = await _classify_category_with_llm(llm_service, extracted_text)
+        if llm_category:
+            final_category = llm_category
 
     result_key = f"job:{job.job_id}"
     payload = {
         "jobId": job.job_id,
         "text": extracted_text,
-        "category": classification.category.value,
+        "expense": expense,
+        "category": final_category,
         "confidence": classification.confidence,
     }
+
+    
     
     await result_redis.xadd("result_stream", payload, maxlen=10000, approximate=True)
 
@@ -339,11 +446,13 @@ async def run_worker_forever() -> None:
 
     fetcher = get_cloudinary_fetcher()
 
-    # Important on Windows: load Faster-Whisper/CTranslate2 before OCR/classifier
-    # to avoid native DLL/OpenMP runtime conflicts (WinError 127).
     from app.services.extractor.voice_extractor import VoiceExtractor
 
     voice_extractor = VoiceExtractor()  # preloads ASR model at worker startup
+
+    from app.services.llm import get_llm_service
+
+    llm_service = get_llm_service()
 
     from app.services.classifer.classifier import get_classifier_service
     from app.services.extractor.image_extractor import ImageExtractor
@@ -408,6 +517,7 @@ async def run_worker_forever() -> None:
                 classifier,
                 image_extractor,
                 voice_extractor,
+                llm_service,
                 stream_key,
                 group,
                 message_id,
