@@ -14,10 +14,13 @@ class Settings(BaseSettings):
 
     # Models
     OCR_MODEL_NAME: str = "pytesseract"
-    # HuggingFace model id/path for ASR (default: PhoWhisper for Vietnamese)
-    ASR_MODEL_NAME: str = "vinai/PhoWhisper-small"
+    # HuggingFace model id/path for ASR (default: Moonshine Small Streaming)
+    ASR_MODEL_NAME: str = "UsefulSensors/moonshine-streaming-small"
     ASR_DEVICE: str = "cpu"  # cpu | cuda
     ASR_COMPUTE_TYPE: str = "float32"  # float16 | float32 (float16 only when ASR_DEVICE=cuda)
+    ASR_TRUST_REMOTE_CODE: bool = False
+    ASR_LANGUAGE: str | None = "vi"
+    ASR_TASK: str | None = "transcribe"
 
     # Redis (input stream)
     # Example: redis://localhost:6379/0
@@ -38,6 +41,14 @@ class Settings(BaseSettings):
     # Download limits
     DOWNLOAD_MAX_BYTES: int = 25 * 1024 * 1024
     DOWNLOAD_TIMEOUT_SECONDS: float = 30.0
+
+    # LLM providers
+    OPENAI_API_KEY: str | None = None
+    OPENAI_BASE_URL: str | None = None
+    OPENAI_MODEL: str = "gpt-4o-mini"
+
+    GEMINI_API_KEY: str | None = None
+    GEMINI_MODEL: str = "gemini-2.0-flash"
 
     class Config:
         env_file = ".env"
