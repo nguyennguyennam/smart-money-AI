@@ -36,6 +36,7 @@ httpx==0.28.1
 
 # ===== LLM =====
 google-genai==1.6.0
+openai==1.47.1
 
 # ===== CLASSIFIER =====
 # model.pkl was pickled with scikit-learn 1.7.x; pinning avoids version warnings.

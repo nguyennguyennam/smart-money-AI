@@ -12,5 +12,11 @@ class Category(str, Enum):
     OTHER = "OTHER"
 
 
+class TransactionType(str, Enum):
+    EXPENSE = "EXPENSE"
+    INCOME = "INCOME"
+
+
 # Backward-compatible constant list of string category names
 CATEGORIES = [c.value for c in Category]
+TRANSACTION_TYPES = [t.value for t in TransactionType]

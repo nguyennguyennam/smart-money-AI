@@ -113,6 +113,51 @@ async def _classify_category_with_llm(llm_service, text_vi: str) -> str | None:
     return None
 
 
+async def _classify_transaction_type(llm_service, text_vi: str) -> str | None:
+    """Classify if transaction is EXPENSE or INCOME using LLM."""
+    if not text_vi or not isinstance(text_vi, str):
+        return None
+
+    prompt = (
+        "Bạn là hệ thống phân loại giao dịch tài chính từ văn bản tiếng Việt.\n"
+        "Hãy trả về DUY NHẤT một loại giao dịch: EXPENSE hoặc INCOME.\n"
+        "EXPENSE: chi tiêu, thanh toán, mua sắm, ...\n"
+        "INCOME: thu nhập, lương, thưởng, tiền nhận, ...\n"
+        "Không giải thích, không thêm ký tự khác.\n"
+        "Nếu không chắc chắn, trả về EXPENSE.\n\n"
+        "Văn bản:\n"
+        "```\n"
+        f"{text_vi}\n"
+        "```\n\n"
+        "Chỉ trả về EXPENSE hoặc INCOME:"
+    )
+
+    try:
+        out = await llm_service.generate(prompt=prompt, provider="gemini")
+    except Exception:
+        return None
+
+    if not out:
+        return None
+
+    out_norm = str(out).strip().upper()
+    
+    # Check for exact match
+    if out_norm == "EXPENSE":
+        return "EXPENSE"
+    if out_norm == "INCOME":
+        return "INCOME"
+    
+    # Fallback: try to find the keyword in response
+    if re.search(r"\bINCOME\b", out_norm):
+        return "INCOME"
+    if re.search(r"\bEXPENSE\b", out_norm):
+        return "EXPENSE"
+    
+    # Default to EXPENSE if unsure
+    return "EXPENSE"
+
+
 def _redis_from_url_checked(url: str, label: str) -> redis.Redis:
     try:
         # Keep connections alive and do periodic health checks to reduce
@@ -387,6 +432,8 @@ async def _process_one(
 
     expense = await _extract_expense_vnd(llm_service, extracted_text)
 
+    transaction_type = await _classify_transaction_type(llm_service, extracted_text)
+
     classification = classifier.classify(extracted_text)
 
     final_category = classification.category.value
@@ -400,6 +447,7 @@ async def _process_one(
         "jobId": job.job_id,
         "text": extracted_text,
         "expense": expense,
+        "type": transaction_type or "EXPENSE",
         "category": final_category,
         "confidence": classification.confidence,
     }
