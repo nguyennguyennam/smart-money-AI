@@ -1,6 +1,10 @@
 # ===== CORE NUMPY (ABI SAFE) =====
 numpy==1.26.4
 
+# Needed by some third-party libs (e.g., gdown -> pkg_resources)
+# Note: in this environment, newer setuptools builds lacked pkg_resources.
+setuptools==70.3.0
+
 # ===== IMAGE PROCESSING =====
 opencv-python==4.6.0.66
 Pillow==10.2.0
@@ -8,25 +12,31 @@ Pillow==10.2.0
 # ===== OCR =====
 paddlepaddle==2.6.2
 paddleocr==2.7.0.3
-vietocr==0.3.11
 
-# ===== TORCH STACK (CPU - Python 3.10 SAFE) =====
-torch==2.2.2
-torchvision==0.17.2
-torchaudio==2.2.2
-timm==0.9.16
+
+# ===== ASR (Moonshine Voice) =====
+moonshine-voice==0.0.52
 
 # ===== AUDIO =====
-sounddevice==0.4.6
-faster-whisper==1.0.3
+# Use ffmpeg for decoding (prebuilt binary via imageio-ffmpeg).
+imageio-ffmpeg==0.4.9
 
 # ===== UI (OPTIONAL) =====
-gradio==4.31.5
+# (removed: gradio)
 
-# ===== API =====
-fastapi>=0.110
-uvicorn[standard]>=0.27
-python-multipart>=0.0.9
+# ===== API (OPTIONAL) =====
+# (removed: fastapi, uvicorn, python-multipart)
+
+# ===== SETTINGS (PYDANTIC v2) =====
+pydantic-settings==2.2.1
+
+# ===== REDIS + HTTP =====
+redis==5.0.4
+httpx==0.28.1
+
+# ===== LLM =====
+google-genai==1.6.0
+openai==1.47.1
 
 # ===== CLASSIFIER =====
 # model.pkl was pickled with scikit-learn 1.7.x; pinning avoids version warnings.

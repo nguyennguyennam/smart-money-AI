@@ -59,7 +59,7 @@ class ClassificationResult:
 class ClassifierService:
 	def __init__(self, model_path: Path | None = None):
 		if model_path is None:
-			model_path = Path(__file__).resolve().parent / "model.pkl"
+			model_path = Path(__file__).resolve().parents[2] / "models" / "classifier_model.pkl"
 
 		if not model_path.exists():
 			raise FileNotFoundError(f"Classifier model not found at: {model_path}")
