@@ -215,14 +215,23 @@ def _decode_stream_fields(fields: dict[Any, Any]) -> dict[str, str]:
     return out
 
 
-def _parse_job(fields: dict[str, str]) -> JobEvent:
+def _parse_job(fields: dict[str, str]) -> JobEvent | None:
+    if fields.get("init") == "true":
+        return None
+    
     job_id = fields.get("jobId") or fields.get("job_id")
+
+    if not job_id:
+        # 🔥 Bỏ qua message không hợp lệ
+        logger.warning(f"Skip invalid message: {fields}")
+        return None
+    
     raw_data = fields.get("data")
     duty = fields.get("duty")
 
     if not job_id:
         raise ValueError("Missing jobId")
-    if not raw_data:
+    if not raw_data and duty and duty.lower() != "notification":
         raise ValueError("Missing data")
     if not duty:
         raise ValueError("Missing duty")
@@ -230,16 +239,18 @@ def _parse_job(fields: dict[str, str]) -> JobEvent:
     # ✅ FIX: parse JSON nếu cần
     file_url = raw_data
 
-    if raw_data.startswith("{"):
+    if raw_data and raw_data.startswith("{"):
         try:
             parsed = json.loads(raw_data)
             file_url = parsed.get("imageUrl")
         except Exception:
             raise ValueError(f"Invalid JSON data: {raw_data}")
 
-    # ✅ validate URL
-    if not file_url or not file_url.startswith("http"):
-        raise ValueError(f"Invalid file_url: {file_url}")
+    # ✅ validate URL (skip for notification duty)
+    duty_lower = duty.lower() if duty else ""
+    if duty_lower != "notification":
+        if not file_url or not file_url.startswith("http"):
+            raise ValueError(f"Invalid file_url: {file_url}")
 
     print(f"Parsed jobId={job_id} file_url={file_url} duty={duty}")
 
@@ -395,6 +406,99 @@ async def _dead_letter(
 def enhance_cloudinary_url(url: str) -> str:
     return url.replace("/upload/", "/upload/q_100/")
 
+
+async def _handle_ocr_duty(image_extractor, download) -> str:
+    """Extract text from image using OCR."""
+    ocr_result = await image_extractor.extract_bytes(download.content)
+    if ocr_result.get("error"):
+        raise RuntimeError(str(ocr_result.get("error")))
+    return str(ocr_result.get("text") or "")
+
+
+async def _handle_voice_duty(voice_extractor, download) -> str:
+    """Extract text from audio using ASR."""
+    asr_result = await voice_extractor.extract_bytes(
+        download.content, content_type=download.content_type
+    )
+    if asr_result.get("error"):
+        raise RuntimeError(str(asr_result.get("error")))
+    return str(asr_result.get("text") or "")
+
+
+async def _handle_notification_duty(fields: dict[str, str]) -> str:
+    """Extract text from notification (text is already provided)."""
+    # Check multiple possible field names
+    text = (
+        fields.get("text") 
+        or fields.get("message") 
+        or fields.get("data")
+        or ""
+    )
+    if not text:
+        raise ValueError(
+            f"Missing text/message/data in notification duty. Available fields: {list(fields.keys())}"
+        )
+    return str(text)
+
+def _extract_amount_from_notification(text: str) -> int | None:
+    if not text:
+        return None
+
+    normalized = text.lower()
+
+    patterns = [
+        # -200000 VND | 200.000đ | +1,500,000 vnđ
+        r"([+-]?\d[\d.,]*)\s*(?:vnd|vnđ|đ)\b",
+
+        # "số tiền: 500000"
+        r"(?:số tiền|so tien|gd)[:\s]+([+-]?\d[\d.,]*)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, normalized, re.IGNORECASE)
+        if not match:
+            continue
+
+        raw = match.group(1)
+
+        # 🔥 giữ lại dấu +/-
+        sign = -1 if raw.strip().startswith("-") else 1
+
+        # remove dấu . , nhưng giữ số
+        digits = re.sub(r"[^\d]", "", raw)
+
+        if not digits:
+            continue
+
+        amount = int(digits) * sign
+
+        # ✅ return số dương (expense)
+        return abs(amount)
+
+    return None
+
+async def _extract_text_by_duty(
+    job: JobEvent,
+    download,
+    image_extractor,
+    voice_extractor,
+    fields: dict[str, str],
+) -> str:
+    """Route to appropriate handler based on duty type."""
+    duty_lower = job.duty.lower()
+    
+    duty_handlers = {
+        "ocr": lambda: _handle_ocr_duty(image_extractor, download),
+        "voice": lambda: _handle_voice_duty(voice_extractor, download),
+        "notification": lambda: _handle_notification_duty(fields),
+    }
+    
+    if duty_lower not in duty_handlers:
+        raise ValueError(f"Unsupported duty: {job.duty}")
+    
+    return await duty_handlers[duty_lower]()
+
+
 async def _process_one(
     input_redis: redis.Redis,
     result_redis: redis.Redis,
@@ -410,29 +514,44 @@ async def _process_one(
 ) -> None:
     job = _parse_job(fields)
 
-    enhanced_url = enhance_cloudinary_url(job.file_url)    
+    if job is None:
+        await input_redis.xack(stream_key, group, message_id)
+        logger.info("Skipped init message id=%s", message_id)
+        return
 
-    download = await fetcher.fetch(enhanced_url)
+    # Only fetch file for OCR/Voice duties
+    download = None
+    if job.duty.lower() in ("ocr", "voice"):
+        enhanced_url = enhance_cloudinary_url(job.file_url)
+        download = await fetcher.fetch(enhanced_url)
 
-    extracted_text = ""
-    if job.duty.lower() == "ocr":
-        ocr_result = await image_extractor.extract_bytes(download.content)
-        if ocr_result.get("error"):
-            raise RuntimeError(str(ocr_result.get("error")))
-        extracted_text = str(ocr_result.get("text") or "")
+    extracted_text = await _extract_text_by_duty(
+        job, download, image_extractor, voice_extractor, fields
+    )
 
-    elif job.duty.lower() == "voice":
-        asr_result = await voice_extractor.extract_bytes(download.content, content_type=download.content_type)
-        if asr_result.get("error"):
-            raise RuntimeError(str(asr_result.get("error")))
-        extracted_text = str(asr_result.get("text") or "")
+    if job.duty.lower() == "notification":
+        expense = _extract_amount_from_notification(extracted_text)
 
+        if expense is None:
+            expense = await _extract_expense_vnd(
+                llm_service,
+                extracted_text
+            )
     else:
-        raise ValueError(f"Unsupported duty: {job.duty}")
-
-    expense = await _extract_expense_vnd(llm_service, extracted_text)
+        expense = await _extract_expense_vnd(
+            llm_service,
+            extracted_text
+        )
 
     transaction_type = await _classify_transaction_type(llm_service, extracted_text)
+
+    if not transaction_type:
+        # Nếu trong text có dấu - hoặc từ khóa chi tiêu => EXPENSE
+        lower_text = extracted_text.lower()
+        if '-' in extracted_text or any(kw in lower_text for kw in ['mua', 'thanh toán', 'chi', 'rút']):
+            transaction_type = "EXPENSE"
+        else:
+            transaction_type = "EXPENSE"  # mặc định vẫn là EXPENSE vì đa số là chi tiêu
 
     classification = classifier.classify(extracted_text)
 
@@ -573,10 +692,44 @@ async def run_worker_forever() -> None:
             )
             logger.info("Processed job stream id=%s jobId=%s", message_id, fields.get("jobId"))
 
+        except ValueError as e:
+
+            err = str(e)
+
+            logger.exception(
+                "Malformed message stream id=%s error=%s",
+                message_id,
+                err,
+            )
+
+            await _dead_letter(
+                input_redis,
+                settings.REDIS_DEAD_LETTER_STREAM_KEY,
+                stream_key,
+                message_id,
+                fields,
+                err,
+            )
+
+            await input_redis.xack(
+                stream_key,
+                group,
+                message_id,
+            )
+
+            continue
+
         except Exception as e:
+
             err = str(e)
             job_id = fields.get("jobId")
-            times_delivered = await _times_delivered(input_redis, stream_key, group, message_id)
+
+            times_delivered = await _times_delivered(
+                input_redis,
+                stream_key,
+                group,
+                message_id,
+            )
 
             logger.exception(
                 "Failed processing stream id=%s jobId=%s delivered=%s error=%s",
@@ -587,7 +740,12 @@ async def run_worker_forever() -> None:
             )
 
             max_retries = int(settings.REDIS_MAX_RETRIES)
-            if times_delivered is not None and max_retries > 0 and times_delivered >= max_retries:
+
+            if (
+                times_delivered is not None
+                and max_retries > 0
+                and times_delivered >= max_retries
+            ):
                 await _dead_letter(
                     input_redis,
                     settings.REDIS_DEAD_LETTER_STREAM_KEY,
@@ -596,11 +754,14 @@ async def run_worker_forever() -> None:
                     fields,
                     err,
                 )
-                await input_redis.xack(stream_key, group, message_id)
 
-            # If not dead-lettered, leave unacked so it can be retried later.
+                await input_redis.xack(
+                    stream_key,
+                    group,
+                    message_id,
+                )
+
             await asyncio.sleep(0.5)
-
 
 def main() -> None:
     asyncio.run(run_worker_forever())
