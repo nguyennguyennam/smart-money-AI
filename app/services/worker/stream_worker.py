@@ -214,6 +214,26 @@ def _decode_stream_fields(fields: dict[Any, Any]) -> dict[str, str]:
         out[k] = v
     return out
 
+def _detect_transaction_type_rule(text: str) -> str | None:
+    if not text:
+        return None
+
+    lower = text.lower()
+
+    # ✅ dấu - => EXPENSE
+    if re.search(r"[-−]\s?\d", text):
+        return "EXPENSE"
+
+    # ✅ từ khóa income
+    if any(kw in lower for kw in ["nhận", "chuyển đến", "cộng tiền", "credit", "ghi có"]):
+        return "INCOME"
+
+    # ✅ từ khóa expense
+    if any(kw in lower for kw in ["trừ", "thanh toán", "chi", "debit", "ghi nợ"]):
+        return "EXPENSE"
+
+    return None
+
 
 def _parse_job(fields: dict[str, str]) -> JobEvent | None:
     if fields.get("init") == "true":
@@ -446,34 +466,29 @@ def _extract_amount_from_notification(text: str) -> int | None:
 
     normalized = text.lower()
 
-    patterns = [
-        # -200000 VND | 200.000đ | +1,500,000 vnđ
-        r"([+-]?\d[\d.,]*)\s*(?:vnd|vnđ|đ)\b",
+    # 🔥 STEP 1: ưu tiên số có dấu (transaction thật)
+    signed_pattern = r"([+-]\d[\d.,]*)\s*(?:vnd|vnđ|đ)\b"
+    match = re.search(signed_pattern, normalized)
 
-        # "số tiền: 500000"
-        r"(?:số tiền|so tien|gd)[:\s]+([+-]?\d[\d.,]*)",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, normalized, re.IGNORECASE)
-        if not match:
-            continue
-
+    if match:
         raw = match.group(1)
-
-        # 🔥 giữ lại dấu +/-
-        sign = -1 if raw.strip().startswith("-") else 1
-
-        # remove dấu . , nhưng giữ số
+        sign = -1 if raw.startswith("-") else 1
         digits = re.sub(r"[^\d]", "", raw)
 
-        if not digits:
-            continue
+        if digits:
+            return int(digits) * sign
 
-        amount = int(digits) * sign
+    # 🔥 STEP 2: fallback (nếu không có dấu)
+    fallback_patterns = [
+        r"(?:gd|so tien|số tiền)[:\s]+([+-]?\d[\d.,]*)",
+    ]
 
-        # ✅ return số dương (expense)
-        return abs(amount)
+    for pattern in fallback_patterns:
+        match = re.search(pattern, normalized)
+        if match:
+            digits = re.sub(r"[^\d]", "", match.group(1))
+            if digits:
+                return int(digits)
 
     return None
 
@@ -543,15 +558,13 @@ async def _process_one(
             extracted_text
         )
 
-    transaction_type = await _classify_transaction_type(llm_service, extracted_text)
+    transaction_type = _detect_transaction_type_rule(extracted_text)
 
     if not transaction_type:
-        # Nếu trong text có dấu - hoặc từ khóa chi tiêu => EXPENSE
-        lower_text = extracted_text.lower()
-        if '-' in extracted_text or any(kw in lower_text for kw in ['mua', 'thanh toán', 'chi', 'rút']):
-            transaction_type = "EXPENSE"
-        else:
-            transaction_type = "EXPENSE"  # mặc định vẫn là EXPENSE vì đa số là chi tiêu
+        transaction_type = await _classify_transaction_type(llm_service, extracted_text)
+
+    if not transaction_type:
+        transaction_type = "EXPENSE"
 
     classification = classifier.classify(extracted_text)
 
@@ -565,12 +578,11 @@ async def _process_one(
     payload = {
         "jobId": job.job_id,
         "text": extracted_text,
-        "expense": expense,
+        "expense": abs(expense) if expense else _DEFAULT_EXPENSE_VND, 
         "type": transaction_type or "EXPENSE",
         "category": final_category,
         "confidence": classification.confidence,
     }
-
     
     
     await result_redis.xadd("result_stream", payload, maxlen=10000, approximate=True)
