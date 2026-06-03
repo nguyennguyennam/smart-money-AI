@@ -5,7 +5,7 @@
 from pedalboard import Pedalboard, HighpassFilter, Compressor, LowShelfFilter, Gain, NoiseGate
 import numpy as np
 
-def enhance_audio_quality (audio):
+def enhance_audio_quality (audio : np.ndarray) -> np.ndarray:
     board =  Pedalboard([
         HighpassFilter(cutoff_frequency_hz=80),
         NoiseGate(threshold_db=-40, ratio=1.5, release_ms=250),

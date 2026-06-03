@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import numpy as np
@@ -12,6 +13,7 @@ except Exception:  # optional dependency
 '''
 
 def reduce_noise (original_audio: np.ndarray) -> np.ndarray:
+
     if nr is None:
         return original_audio
 

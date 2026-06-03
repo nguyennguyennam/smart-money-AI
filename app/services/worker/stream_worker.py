@@ -19,7 +19,7 @@ from app.services.fetcher.cloudinary_fetcher import get_cloudinary_fetcher
 logger = logging.getLogger(__name__)
 
 
-_DEFAULT_EXPENSE_VND = 50_000
+_DEFAULT_EXPENSE_VND = 50000
 _CATEGORY_LLM_FALLBACK_THRESHOLD = 0.25
 
 
@@ -427,6 +427,37 @@ def enhance_cloudinary_url(url: str) -> str:
     return url.replace("/upload/", "/upload/q_100/")
 
 
+async def _publish_extraction_error(
+    input_redis: redis.Redis,
+    result_redis: redis.Redis,
+    stream_key: str,
+    group: str,
+    message_id: str,
+    job_id: str,
+    error_msg: str,
+) -> None:
+    """Publish an error result for a job whose content cannot be extracted (e.g. blank/blur image).
+
+    Writes to result_stream and the job key so consumers get an immediate response,
+    then ACKs the message so it is never retried (content quality won't improve on retry).
+    """
+    payload = {
+        "jobId": job_id,
+        "error": error_msg,
+        "text": "",
+        "expense": _DEFAULT_EXPENSE_VND,
+        "type": "EXPENSE",
+        "category": "OTHER",
+        "confidence": 0.0,
+    }
+    await result_redis.xadd("result_stream", payload, maxlen=10000, approximate=True)
+    result_key = f"job:{job_id}"
+    ttl = int(settings.RESULT_TTL_SECONDS)
+    if ttl > 0:
+        await result_redis.setex(result_key, ttl, json.dumps(payload, ensure_ascii=False))
+    else:
+        await result_redis.set(result_key, json.dumps(payload, ensure_ascii=False))
+    await input_redis.xack(stream_key, group, message_id)
 async def _handle_ocr_duty(image_extractor, download) -> str:
     """Extract text from image using OCR."""
     ocr_result = await image_extractor.extract_bytes(download.content)
@@ -527,77 +558,119 @@ async def _process_one(
     message_id: str,
     fields: dict[str, str],
 ) -> None:
-    job = _parse_job(fields)
+      job = _parse_job(fields)
 
-    if job is None:
-        await input_redis.xack(stream_key, group, message_id)
-        logger.info("Skipped init message id=%s", message_id)
-        return
+      if job is None:
+          await input_redis.xack(stream_key, group, message_id)
+          logger.info("Skipped init message id=%s", message_id)
+          return
 
-    # Only fetch file for OCR/Voice duties
-    download = None
-    if job.duty.lower() in ("ocr", "voice"):
-        enhanced_url = enhance_cloudinary_url(job.file_url)
-        download = await fetcher.fetch(enhanced_url)
+      download = None
 
-    extracted_text = await _extract_text_by_duty(
-        job, download, image_extractor, voice_extractor, fields
-    )
+      if job.duty.lower() in ("ocr", "voice"):
+          enhanced_url = enhance_cloudinary_url(job.file_url)
+          download = await fetcher.fetch(enhanced_url)
 
-    if job.duty.lower() == "notification":
-        expense = _extract_amount_from_notification(extracted_text)
+      try:
+          extracted_text = await _extract_text_by_duty(
+              job,
+              download,
+              image_extractor,
+              voice_extractor,
+              fields,
+          )
+      except Exception as e:
+          await _publish_extraction_error(
+              input_redis,
+              result_redis,
+              stream_key,
+              group,
+              message_id,
+              job.job_id,
+              str(e),
+          )
+          return
 
-        if expense is None:
-            expense = await _extract_expense_vnd(
-                llm_service,
-                extracted_text
-            )
-    else:
-        expense = await _extract_expense_vnd(
-            llm_service,
-            extracted_text
-        )
+      if not extracted_text.strip():
+          await _publish_extraction_error(
+              input_redis,
+              result_redis,
+              stream_key,
+              group,
+              message_id,
+              job.job_id,
+              "No readable text content found in the uploaded file",
+          )
+          return
 
-    transaction_type = _detect_transaction_type_rule(extracted_text)
+      if job.duty.lower() == "notification":
+          expense = _extract_amount_from_notification(extracted_text)
 
-    if not transaction_type:
-        transaction_type = await _classify_transaction_type(llm_service, extracted_text)
+          if expense is None:
+              expense = await _extract_expense_vnd(
+                  llm_service,
+                  extracted_text,
+              )
+      else:
+          expense = await _extract_expense_vnd(
+              llm_service,
+              extracted_text,
+          )
 
-    if not transaction_type:
-        transaction_type = "EXPENSE"
+      transaction_type = _detect_transaction_type_rule(extracted_text)
 
-    classification = classifier.classify(extracted_text)
+      if not transaction_type:
+          transaction_type = await _classify_transaction_type(llm_service, extracted_text)
 
-    final_category = classification.category.value
-    if float(classification.confidence) < _CATEGORY_LLM_FALLBACK_THRESHOLD:
-        llm_category = await _classify_category_with_llm(llm_service, extracted_text)
-        if llm_category:
-            final_category = llm_category
+      if not transaction_type:
+          transaction_type = "EXPENSE"
 
-    result_key = f"job:{job.job_id}"
-    payload = {
-        "jobId": job.job_id,
-        "text": extracted_text,
-        "expense": abs(expense) if expense else _DEFAULT_EXPENSE_VND, 
-        "type": transaction_type or "EXPENSE",
-        "category": final_category,
-        "confidence": classification.confidence,
-    }
-    
-    
-    await result_redis.xadd("result_stream", payload, maxlen=10000, approximate=True)
+      final_category = "OTHER"
+      confidence = 0.0
+      try:
+          classification = classifier.classify(extracted_text)
+          if classification.error or classification.category is None:
+              logger.warning("Classifier returned no category for job %s: %s", job.job_id, classification.error)
+              llm_category = await _classify_category_with_llm(llm_service, extracted_text)
+              if llm_category:
+                  final_category = llm_category
+          else:
+              final_category = classification.category.value
+              confidence = float(classification.confidence)
+              if confidence < _CATEGORY_LLM_FALLBACK_THRESHOLD:
+                  llm_category = await _classify_category_with_llm(llm_service, extracted_text)
+                  if llm_category:
+                      final_category = llm_category
+      except Exception as e:
+          logger.warning("Classifier raised for job %s: %s — falling back to LLM", job.job_id, e)
+          llm_category = await _classify_category_with_llm(llm_service, extracted_text)
+          if llm_category:
+              final_category = llm_category
 
-    ttl = int(settings.RESULT_TTL_SECONDS)
-    if ttl > 0:
-        await result_redis.setex(
-            result_key,
-            ttl,
-            json.dumps(payload, ensure_ascii=False),
-        )
-    else:
-        await result_redis.set(result_key, json.dumps(payload, ensure_ascii=False))
+      result_key = f"job:{job.job_id}"
+      payload = {
+          "jobId": job.job_id,
+          "text": extracted_text,
+          "expense": abs(expense) if expense else _DEFAULT_EXPENSE_VND, 
+          "type": transaction_type or "EXPENSE",
+          "category": final_category,
+          "confidence": confidence,
+      }
 
-    await input_redis.xack(stream_key, group, message_id)
+
+      await result_redis.xadd("result_stream", payload, maxlen=10000, approximate=True)
+
+      ttl = int(settings.RESULT_TTL_SECONDS)
+      if ttl > 0:
+          await result_redis.setex(
+              result_key,
+              ttl,
+              json.dumps(payload, ensure_ascii=False),
+          )
+      else:
+          await result_redis.set(result_key, json.dumps(payload, ensure_ascii=False))
+
+      await input_redis.xack(stream_key, group, message_id)
 
 
 async def run_worker_forever() -> None:

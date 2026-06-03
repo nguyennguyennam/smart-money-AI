@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from app.route.endpoints import router
+from route.endpoints import router
 
 app = FastAPI(
     title="OCR API",

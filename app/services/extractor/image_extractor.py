@@ -7,11 +7,11 @@ from typing import TYPE_CHECKING
 from PIL import Image
 
 from .base import BaseExtractor
-from app.models.ocr_model import OCRModel
-from app.pipeline.ocr_pipeline import OCRPipeline
-
-if TYPE_CHECKING:  # pragma: no cover
-    from fastapi import UploadFile
+from ...models.ocr_model import OCRModel
+from ...pipeline.ocr_pipeline import OCRPipeline
+from PIL import Image
+import asyncio
+import io
 
 
 class ImageExtractor(BaseExtractor):

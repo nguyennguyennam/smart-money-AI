@@ -5,7 +5,7 @@ try:
     from pydantic_settings import BaseSettings
 except Exception:  # pragma: no cover
     # Pydantic v1 fallback
-    from pydantic import BaseSettings
+    from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
@@ -30,13 +30,13 @@ class Settings(BaseSettings):
     REDIS_CONSUMER_NAME: str = "smartmoney-ai-1"
     REDIS_BLOCK_MS: int = 5_000
     REDIS_CLAIM_IDLE_MS: int = 60_000
-    REDIS_MAX_RETRIES: int = 10
+    REDIS_MAX_RETRIES: int = 5
     REDIS_DEAD_LETTER_STREAM_KEY: str = ""
 
     # Redis (result storage) — can be a separate instance/host.
     # Default points to a separate logical DB for convenience.
     REDIS_RESULT_URL: str = "redis://localhost:6379/1"
-    RESULT_TTL_SECONDS: int = 86_400  # 1 day
+    RESULT_TTL_SECONDS: int = 180  #  3 mins
 
     # Download limits
     DOWNLOAD_MAX_BYTES: int = 25 * 1024 * 1024

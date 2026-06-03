@@ -8,7 +8,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Tuple
 
-from app.services.classifer.enums import Category
+from .enums import Category
 
 
 _ALLOWED_VIET_CHARS = "A-Za-zÀ-ỹĐđ"
@@ -54,6 +54,7 @@ def _softmax(values: list[float]) -> list[float]:
 class ClassificationResult:
 	category: Category
 	confidence: float
+	error: str | None = None
 
 
 class ClassifierService:
@@ -70,8 +71,9 @@ class ClassifierService:
 
 	def classify(self, raw_text: str) -> ClassificationResult:
 		cleaned = clean_text(raw_text)
-		if not cleaned:
-			raise ValueError("Text is empty after cleaning")
+		if len(cleaned) == 0 or not cleaned:
+			return ClassificationResult(category=None, confidence=0.0, error="No text to is found after cleaning")
+
 
 		model = self._model
 

@@ -22,12 +22,16 @@ from app.core.config import settings
 @dataclass(frozen=True)
 class ASRSegment:
    text: str
+'''
+   Define asr model using Faster-whisper.
+   Apply cpu_threads and num_workers to speed up the inference process.
+'''
 
 
 class ASRModel:
    def __init__(self) -> None:
       print("Loading ASR Model (Moonshine Voice)...")
-
+      model_size = "base"
       try:
          import moonshine_voice
       except Exception as e:  # pragma: no cover
@@ -82,5 +86,6 @@ class ASRModel:
       if not text:
          return []
       return [ASRSegment(text=text)]
+
 
    
