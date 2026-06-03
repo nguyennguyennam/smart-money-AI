@@ -1,8 +1,0 @@
-Pillow>=9.0.0
-pytesseract==0.3.13
-gradio==6.5.1
-opencv-python
-faster-whisper
-sounddevice
-spicy
-numpy
