@@ -8,7 +8,8 @@ from typing import Any
 import numpy as np
 import imageio_ffmpeg
 
-from app.services.extractor.voice import noise_reduce, volume_normalize
+from app.services.extractor.voice import noise_reduce, volume_normalize, audio_quality
+from ..models.asr_model import ASRModel
 
 
 def _suffix_from_content_type(content_type: str | None) -> str:
@@ -104,18 +105,36 @@ def _load_audio_any(voice: Any, content_type: str | None) -> tuple[np.ndarray, i
 
 class ASRPipeline:
     def __init__(self, model):
-        self.model = model
+        self.model = ASRModel()
 
     def run(self, voice: Any, content_type: str | None = None):
-        audio_array, _sr = load_audio_any(voice, content_type)
+        try:
+            audio_array, _sr = load_audio_any(voice, content_type)
+        except ValueError as e:
+            return {"error": f"Could not decode audio: {e}", "text": ""}
+
+        if audio_array.size == 0:
+            return {"error": "Audio file is empty or has no content", "text": ""}
+
+        # Minimum 0.5 s at 16 kHz — anything shorter is not meaningful speech
+        if audio_array.size < 8000:
+            return {"error": "Audio is too short to transcribe", "text": ""}
+
+        audio_array = audio_quality.enhance_audio_quality(audio_array)
+        # pedalboard returns 2D (channels, samples) for mono input — squeeze to 1D
+        if audio_array.ndim > 1:
+            audio_array = np.squeeze(audio_array)
 
         audio_array = noise_reduce.reduce_noise(audio_array)
-        audio_array = volume_normalize.normalize_volume(audio_array, volume=0.1)
+        audio_array = volume_normalize.normalize_volume(audio_array, volume=0.3)
 
+        if audio_array.size == 0 or np.abs(audio_array).max() < 0.01:
+            return {"error": "Audio is too quiet or has no content", "text": ""}
 
-        segments, info = self.model.transcribe(
-            audio_array,
-        )
+        segments = self.model.transcribe(audio_array)
         text = " ".join([seg.text for seg in segments])
+
+        if not text.strip():
+            return {"error": "No speech detected in audio", "text": ""}
 
         return {"error": None, "text": text}

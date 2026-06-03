@@ -1,64 +1,44 @@
-numpy==1.26.4
-sounddevice>=0.4.7
-librosa>=0.10.0
-noisereduce>=2.0.2
-pedalboard>=0.6.2
+    # ===== CORE NUMPY (ABI SAFE) =====
+    numpy==1.26.4
 
-faster-whisper==1.2.1
-ctranslate2==4.4.0
+    # Needed by some third-party libs (e.g., gdown -> pkg_resources)
+    # Note: in this environment, newer setuptools builds lacked pkg_resources.
+    setuptools==70.3.0
 
-timm==0.9.2
-Pillow>=9.0.0
-opencv-python==4.6.0.66
+    # ===== IMAGE PROCESSING =====
+    opencv-python==4.6.0.66
+    Pillow==10.2.0
 
-paddlepaddle==2.6.2
-paddleocr==2.7.0.3
-vietocr
-
-torch==2.2.2+cpu
-torchvision==0.17.2+cpu
-torchaudio==2.2.2+cpu
-=======
-# ===== CORE NUMPY (ABI SAFE) =====
-numpy==1.26.4
-
-# Needed by some third-party libs (e.g., gdown -> pkg_resources)
-# Note: in this environment, newer setuptools builds lacked pkg_resources.
-setuptools==70.3.0
-
-# ===== IMAGE PROCESSING =====
-opencv-python==4.6.0.66
-Pillow==10.2.0
-
-# ===== OCR =====
-paddlepaddle==2.6.2
-paddleocr==2.7.0.3
+    # ===== OCR =====
+    paddlepaddle==2.6.2
+    paddleocr==2.8.1
+    PyMuPDF==1.23.8
 
 
-# ===== ASR (Moonshine Voice) =====
-moonshine-voice==0.0.52
+    # ===== ASR (Moonshine Voice) =====
+    moonshine-voice==0.0.52
 
-# ===== AUDIO =====
-# Use ffmpeg for decoding (prebuilt binary via imageio-ffmpeg).
-imageio-ffmpeg==0.4.9
+    # ===== AUDIO =====
+    # Use ffmpeg for decoding (prebuilt binary via imageio-ffmpeg).
+    imageio-ffmpeg==0.4.9
 
-# ===== UI (OPTIONAL) =====
-# (removed: gradio)
+    # ===== UI (OPTIONAL) =====
+    # (removed: gradio)
 
-# ===== API (OPTIONAL) =====
-# (removed: fastapi, uvicorn, python-multipart)
+    # ===== API (OPTIONAL) =====
+    # (removed: fastapi, uvicorn, python-multipart)
 
-# ===== SETTINGS (PYDANTIC v2) =====
-pydantic-settings==2.2.1
+    # ===== SETTINGS (PYDANTIC v2) =====
+    pydantic-settings==2.2.1
 
-# ===== REDIS + HTTP =====
-redis==5.0.4
-httpx==0.28.1
+    # ===== REDIS + HTTP =====
+    redis==5.0.4
+    httpx==0.28.1
 
-# ===== LLM =====
-google-genai==1.6.0
-openai==1.47.1
+    # ===== LLM =====
+    google-genai==1.6.0
+    openai==1.47.1
 
-# ===== CLASSIFIER =====
-# model.pkl was pickled with scikit-learn 1.7.x; pinning avoids version warnings.
-scikit-learn==1.7.0
+    # ===== CLASSIFIER =====
+    # model.pkl was pickled with scikit-learn 1.7.x; pinning avoids version warnings.
+    scikit-learn==1.7.0

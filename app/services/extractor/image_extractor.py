@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING
 from PIL import Image
 
 from .base import BaseExtractor
-from models.ocr_model import OCRModel
-from pipeline.ocr_pipeline import OCRPipeline
+from ...models.ocr_model import OCRModel
+from ...pipeline.ocr_pipeline import OCRPipeline
 from PIL import Image
 import asyncio
 import io

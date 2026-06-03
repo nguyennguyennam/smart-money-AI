@@ -3,9 +3,9 @@ from functools import lru_cache
 from fastapi import APIRouter, UploadFile, File, Form
 from pydantic import BaseModel
 
-from app.core.enums import InputType
-from app.services.classifer.classifier import get_classifier_service
-from app.schemas.response import Response
+from core.enums import InputType
+from services.classifer.classifier import get_classifier_service
+from schemas.response import Response
 
 router = APIRouter()
 classifier_service = get_classifier_service()
