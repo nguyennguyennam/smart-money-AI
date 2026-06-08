@@ -15,6 +15,7 @@ from redis.exceptions import ResponseError
 
 from app.core.config import settings
 from app.services.fetcher.cloudinary_fetcher import get_cloudinary_fetcher
+from app.services.budget.budget_predictor import BudgetPredictor
 
 logger = logging.getLogger(__name__)
 
@@ -450,7 +451,8 @@ async def _publish_extraction_error(
         "category": "OTHER",
         "confidence": 0.0,
     }
-    await result_redis.xadd("result_stream", payload, maxlen=10000, approximate=True)
+    result_stream_key = getattr(settings, "REDIS_RESULT_STREAM_KEY", "result_stream")
+    await result_redis.xadd(result_stream_key, payload, maxlen=10000, approximate=True)
     result_key = f"job:{job_id}"
     ttl = int(settings.RESULT_TTL_SECONDS)
     if ttl > 0:
@@ -684,8 +686,14 @@ async def run_worker_forever() -> None:
     if consumer_name == "smartmoney-ai-1":
         consumer_name = f"{socket.gethostname()}-{os.getpid()}"
 
+    #consumer_name = f"{settings.REDIS_CONSUMER_NAME}-{socket.gethostname()}-{os.getpid()}"
+
     stream_key = settings.REDIS_STREAM_KEY
     group = settings.REDIS_CONSUMER_GROUP
+
+    logger.info("CONFIG REDIS_STREAM_KEY=%s", stream_key)
+    logger.info("CONFIG REDIS_CONSUMER_GROUP=%s", group)
+    logger.info("CONFIG REDIS_CONSUMER_NAME=%s", consumer_name)
 
     async def connect() -> tuple[redis.Redis, redis.Redis]:
         in_r = _redis_from_url_checked(settings.REDIS_STREAM_URL, "REDIS_STREAM_URL")
@@ -710,8 +718,17 @@ async def run_worker_forever() -> None:
     from app.services.classifer.classifier import get_classifier_service
     from app.services.extractor.image_extractor import ImageExtractor
 
+    print("STEP 8: loading classifier...")
     classifier = get_classifier_service()
+    print("STEP 9: classifier loaded")
+
+    print("STEP 10: loading image extractor...")
     image_extractor = ImageExtractor()
+    print("STEP 11: image extractor loaded")
+
+    print("STEP 12: loading budget predictor...")
+    budget_predictor = BudgetPredictor()
+    print("STEP 13: budget predictor loaded")
 
     logger.info(
         "Worker started. stream=%s group=%s consumer=%s",
@@ -719,6 +736,8 @@ async def run_worker_forever() -> None:
         group,
         consumer_name,
     )
+
+    print("Worker is running and waiting for jobs...")
 
     while True:
         try:
@@ -762,92 +781,218 @@ async def run_worker_forever() -> None:
 
         message_id, fields = item
 
-        try:
-            await _process_one(
-                input_redis,
-                result_redis,
-                fetcher,
-                classifier,
-                image_extractor,
-                voice_extractor,
-                llm_service,
-                stream_key,
-                group,
-                message_id,
-                fields,
-            )
-            logger.info("Processed job stream id=%s jobId=%s", message_id, fields.get("jobId"))
+try:
+    logger.warning("RAW STREAM MESSAGE id=%s fields=%s", message_id, fields)
+    logger.warning(
+        "CURRENT PROCESS consumer=%s pid=%s stream=%s group=%s",
+        consumer_name,
+        os.getpid(),
+        stream_key,
+        group,
+    )
 
-        except ValueError as e:
+    # Skip init messages (from feat/budget-allocation)
+    if fields.get("init") in ("true", '"true"'):
+        logger.warning("Skip invalid stream message id=%s fields=%s", message_id, fields)
+        await input_redis.xack(stream_key, group, message_id)
+        continue
 
-            err = str(e)
+    duty = (fields.get("duty") or "").strip().upper()
 
-            logger.exception(
-                "Malformed message stream id=%s error=%s",
-                message_id,
-                err,
-            )
+    # Dispatch based on duty type (budget allocation added in feat/budget-allocation)
+    if duty == "BUDGET_ALLOCATION_PLAN":
+        await _process_budget_allocation_one(
+            input_redis=input_redis,
+            result_redis=result_redis,
+            predictor=budget_predictor,
+            stream_key=stream_key,
+            group=group,
+            message_id=message_id,
+            fields=fields,
+        )
+    else:
+        await _process_one(
+            input_redis,
+            result_redis,
+            fetcher,
+            classifier,
+            image_extractor,
+            voice_extractor,
+            llm_service,
+            stream_key,
+            group,
+            message_id,
+            fields,
+        )
 
-            await _dead_letter(
-                input_redis,
-                settings.REDIS_DEAD_LETTER_STREAM_KEY,
-                stream_key,
-                message_id,
-                fields,
-                err,
-            )
+    logger.info(
+        "Processed job stream id=%s jobId=%s duty=%s",
+        message_id,
+        fields.get("jobId"),
+        duty,
+    )
 
-            await input_redis.xack(
-                stream_key,
-                group,
-                message_id,
-            )
+# Handle malformed messages (ValueError added in feat/redis_consumer)
+except ValueError as e:
+    err = str(e)
+    logger.exception(
+        "Malformed message stream id=%s error=%s",
+        message_id,
+        err,
+    )
+    await _dead_letter(
+        input_redis,
+        settings.REDIS_DEAD_LETTER_STREAM_KEY,
+        stream_key,
+        message_id,
+        fields,
+        err,
+    )
+    await input_redis.xack(stream_key, group, message_id)
+    continue
 
-            continue
+# Handle other processing errors (existing from both branches)
+except Exception as e:
+    err = str(e)
+    job_id = fields.get("jobId")
+    times_delivered = await _times_delivered(
+        input_redis,
+        stream_key,
+        group,
+        message_id,
+    )
+    logger.exception(
+        "Failed processing stream id=%s jobId=%s delivered=%s error=%s",
+        message_id,
+        job_id,
+        times_delivered,
+        err,
+    )
+    max_retries = int(settings.REDIS_MAX_RETRIES)
+    if (
+        times_delivered is not None
+        and max_retries > 0
+        and times_delivered >= max_retries
+    ):
+        await _dead_letter(
+            input_redis,
+            settings.REDIS_DEAD_LETTER_STREAM_KEY,
+            stream_key,
+            message_id,
+            fields,
+            err,
+        )
+        await input_redis.xack(stream_key, group, message_id)
+     await asyncio.sleep(0.5)
 
-        except Exception as e:
 
-            err = str(e)
-            job_id = fields.get("jobId")
+# Budget
+def _parse_budget_payload(fields: dict[str, str]) -> tuple[str, str, dict]:
+    job_id = fields.get("jobId") or fields.get("job_id")
+    user_id = fields.get("userId") or fields.get("user_id")
+    duty = (fields.get("duty") or "").strip().upper()
 
-            times_delivered = await _times_delivered(
-                input_redis,
-                stream_key,
-                group,
-                message_id,
-            )
+    raw_payload = (
+        fields.get("payload")
+        or fields.get("data")
+        or fields.get("body")
+    )
 
-            logger.exception(
-                "Failed processing stream id=%s jobId=%s delivered=%s error=%s",
-                message_id,
-                job_id,
-                times_delivered,
-                err,
-            )
+    logger.info("Parsing budget allocation jobId=%s userId=%s duty=%s", job_id, user_id, duty)
 
-            max_retries = int(settings.REDIS_MAX_RETRIES)
+    if not job_id:
+        raise ValueError("Missing jobId in budget allocation job")
+    if not user_id:
+        raise ValueError("Missing userId in budget allocation job")
+    if not duty:
+        raise ValueError("Missing duty in budget allocation job")
+    if duty != "BUDGET_ALLOCATION_PLAN":
+        raise ValueError(f"Unsupported budget duty: {duty}")
+    if not raw_payload:
+        raise ValueError("Missing payload in budget allocation job")
 
-            if (
-                times_delivered is not None
-                and max_retries > 0
-                and times_delivered >= max_retries
-            ):
-                await _dead_letter(
-                    input_redis,
-                    settings.REDIS_DEAD_LETTER_STREAM_KEY,
-                    stream_key,
-                    message_id,
-                    fields,
-                    err,
-                )
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON payload in budget allocation job: {e}") from e
 
-                await input_redis.xack(
-                    stream_key,
-                    group,
-                    message_id,
-                )
+    return str(job_id), str(user_id), payload
 
-            await asyncio.sleep(0.5)
+async def _process_budget_allocation_one(
+    input_redis: redis.Redis,
+    result_redis: redis.Redis,
+    predictor,
+    stream_key: str,
+    group: str,
+    message_id: str,
+    fields: dict[str, str],
+) -> None:
+    logger.warning("ENTER _process_budget_allocation_one fields=%s", fields)
+
+    job_id, user_id, data = _parse_budget_payload(fields)
+
+    logger.warning("PARSED BUDGET job_id=%s user_id=%s data=%s", job_id, user_id, data)
+
+    total_budget = int(data["safe_spending"])
+    currency = data.get("currency", "VND")
+    profile = data["user_profile"]
+
+    logger.warning("CALLING BUDGET PREDICTOR total_budget=%s profile=%s", total_budget, profile)
+
+    prediction = predictor.predict(
+        total_budget=total_budget,
+        profile=profile,
+    )
+
+    logger.warning("BUDGET PREDICTION RESULT=%s", prediction)
+
+    result = {
+        "totalBudget": total_budget,
+        "currency": currency,
+        "categories": prediction["categories"],
+    }
+
+    payload = {
+        "jobId": job_id,
+        "userId": user_id,
+        "duty": "BUDGET_ALLOCATION_PLAN",
+        "status": "COMPLETED",
+        "type": "BUDGET_ALLOCATION_RESULT",
+        "result": json.dumps(result, ensure_ascii=False),
+    }
+
+    logger.warning("PUBLISHING BUDGET RESULT payload=%s", payload)
+
+    await result_redis.xadd(
+        "result_stream",
+        payload,
+        maxlen=10000,
+        approximate=True,
+    )
+
+    logger.warning("PUBLISHED BUDGET RESULT TO result_stream job_id=%s", job_id)
+
+    result_key = f"job:{job_id}"
+    ttl = int(settings.RESULT_TTL_SECONDS)
+
+    if ttl > 0:
+        await result_redis.setex(
+            result_key,
+            ttl,
+            json.dumps(payload, ensure_ascii=False),
+        )
+    else:
+        await result_redis.set(
+            result_key,
+            json.dumps(payload, ensure_ascii=False),
+        )
+
+    logger.warning("SAVED BUDGET RESULT KEY=%s", result_key)
+
+    await input_redis.xack(stream_key, group, message_id)
+
+    logger.warning("ACKED BUDGET MESSAGE id=%s job_id=%s", message_id, job_id)
+
 
 def main() -> None:
     asyncio.run(run_worker_forever())
