@@ -1,0 +1,96 @@
+{
+  "model_version": "PROFILE_BASED_CATBOOST",
+  "category_cols": [
+    "FOOD",
+    "TRANSPORT",
+    "SHOPPING",
+    "ENTERTAINMENT",
+    "UTILITIES",
+    "HEALTH",
+    "EDUCATION",
+    "OTHER"
+  ],
+  "target_cols": [
+    "FOOD_ratio",
+    "TRANSPORT_ratio",
+    "SHOPPING_ratio",
+    "ENTERTAINMENT_ratio",
+    "UTILITIES_ratio",
+    "HEALTH_ratio",
+    "EDUCATION_ratio",
+    "OTHER_ratio"
+  ],
+  "feature_cols": [
+    "role",
+    "total_budget",
+    "living_status",
+    "income_level",
+    "transport_mode",
+    "spending_style",
+    "work_style",
+    "family_status",
+    "study_intensity",
+    "health_need"
+  ],
+  "categorical_cols": [
+    "role",
+    "living_status",
+    "income_level",
+    "transport_mode",
+    "spending_style",
+    "work_style",
+    "family_status",
+    "study_intensity",
+    "health_need"
+  ],
+  "allowed_values": {
+    "role": [
+      "business_owner",
+      "freelancer",
+      "office_worker",
+      "student"
+    ],
+    "living_status": [
+      "dorm",
+      "own_house",
+      "rent_room",
+      "with_family"
+    ],
+    "income_level": [
+      "high",
+      "low",
+      "medium"
+    ],
+    "transport_mode": [
+      "bus",
+      "car",
+      "motorbike",
+      "ride_hailing"
+    ],
+    "spending_style": [
+      "balanced",
+      "frugal",
+      "spender"
+    ],
+    "work_style": [
+      "hybrid",
+      "none",
+      "onsite",
+      "part_time",
+      "remote"
+    ],
+    "family_status": [
+      "married",
+      "single"
+    ],
+    "study_intensity": [
+      "course_heavy",
+      "normal"
+    ],
+    "health_need": [
+      "high",
+      "low",
+      "normal"
+    ]
+  }
+}

@@ -42,3 +42,7 @@
     # ===== CLASSIFIER =====
     # model.pkl was pickled with scikit-learn 1.7.x; pinning avoids version warnings.
     scikit-learn==1.7.0
+
+    # ===== BUDGET =====
+    pandas==2.2.2
+    catboost==1.2.7
