@@ -15,11 +15,11 @@ class Settings(BaseSettings):
     # Models
     OCR_MODEL_NAME: str = "pytesseract"
     # HuggingFace model id/path for ASR (default: Moonshine Small Streaming)
-    ASR_MODEL_NAME: str = "UsefulSensors/moonshine-streaming-small"
+    ASR_MODEL_NAME: str = "base"  # faster-whisper model size: tiny|base|small|medium|large-v2|large-v3
     ASR_DEVICE: str = "cpu"  # cpu | cuda
     ASR_COMPUTE_TYPE: str = "float32"  # float16 | float32 (float16 only when ASR_DEVICE=cuda)
     ASR_TRUST_REMOTE_CODE: bool = False
-    ASR_LANGUAGE: str | None = "vi"
+    ASR_LANGUAGE: str | None = None  # None / "auto" = detect from audio; or "vi", "en", etc.
     ASR_TASK: str | None = "transcribe"
 
     # Redis (input stream)

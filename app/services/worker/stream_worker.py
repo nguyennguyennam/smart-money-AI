@@ -535,6 +535,7 @@ async def _process_one(
     await input_redis.xack(stream_key, group, message_id)
 
 
+
 async def run_worker_forever() -> None:
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),

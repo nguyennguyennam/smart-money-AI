@@ -1,12 +1,10 @@
-"""ASR model wrapper.
+"""ASR model wrapper using faster-whisper.
 
-This project uses the official `moonshine-voice` PyPI package (as demonstrated
-in `getting_started_with_moonshine_voice.ipynb`). This avoids relying on
-Transformers' model mappings, which may not yet include Moonshine streaming
-types in older versions.
+Auto-detects the audio language and transcribes in that language when
+ASR_LANGUAGE is not set (or set to "auto"). Set ASR_LANGUAGE to a BCP-47
+code (e.g. "vi", "en") to force a specific language.
 
-Contract: `transcribe()` returns an iterable of objects with a `.text` attribute
-so existing pipeline code can join segment texts.
+Contract: `transcribe()` returns an iterable of objects with a `.text` attribute.
 """
 
 from __future__ import annotations
@@ -21,71 +19,55 @@ from app.core.config import settings
 
 @dataclass(frozen=True)
 class ASRSegment:
-   text: str
-'''
-   Define asr model using Faster-whisper.
-   Apply cpu_threads and num_workers to speed up the inference process.
-'''
+    text: str
 
 
 class ASRModel:
-   def __init__(self) -> None:
-      print("Loading ASR Model (Moonshine Voice)...")
-      model_size = "base"
-      try:
-         import moonshine_voice
-      except Exception as e:  # pragma: no cover
-         raise ImportError(
-            "Missing ASR dependency 'moonshine-voice'. Install with: pip install -r app/libs.txt"
-         ) from e
+    def __init__(self) -> None:
+        print("Loading ASR Model (faster-whisper)...")
+        try:
+            from faster_whisper import WhisperModel
+        except Exception as e:  # pragma: no cover
+            raise ImportError(
+                "Missing ASR dependency 'faster-whisper'. Install with: pip install faster-whisper"
+            ) from e
 
-      # Primary control is via ASR_LANGUAGE (e.g., 'vi', 'en').
-      # For backwards compatibility, if ASR_MODEL_NAME looks like a language code,
-      # we accept it as an override.
-      lang = (getattr(settings, "ASR_LANGUAGE", None) or "").strip()
-      model_name = (getattr(settings, "ASR_MODEL_NAME", None) or "").strip()
-      if (not lang) and model_name and ("/" not in model_name) and ("\\" not in model_name) and (len(model_name) <= 10):
-         lang = model_name
-      if not lang:
-         lang = "en"
+        model_name = (getattr(settings, "ASR_MODEL_NAME", None) or "").strip()
+        # ASR_MODEL_NAME should be a Whisper model size; fall back to "base"
+        valid_sizes = {"tiny", "base", "small", "medium", "large", "large-v2", "large-v3"}
+        if not model_name or model_name not in valid_sizes:
+            model_name = "base"
 
-      self._moonshine_voice = moonshine_voice
-      self._language = lang
-      self._model_path, self._model_arch = moonshine_voice.get_model_for_language(lang)
-      self._transcriber = moonshine_voice.Transcriber(
-         model_path=self._model_path,
-         model_arch=self._model_arch,
-      )
+        device = (getattr(settings, "ASR_DEVICE", None) or "cpu").strip()
+        compute_type = (getattr(settings, "ASR_COMPUTE_TYPE", None) or "float32").strip()
 
-      print(f"ASR Model loaded (moonshine-voice): lang={lang}")
+        lang_cfg = (getattr(settings, "ASR_LANGUAGE", None) or "").strip().lower()
+        # None / empty / "auto" → let Whisper detect the language from audio
+        self._language: str | None = None if (not lang_cfg or lang_cfg == "auto") else lang_cfg
 
-   def transcribe(self, audio: object) -> Iterable[ASRSegment]:
-      if audio is None:
-         return []
+        self._model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        print(
+            f"ASR Model loaded (faster-whisper): model={model_name} device={device} "
+            f"language={'auto-detect' if self._language is None else self._language}"
+        )
 
-      audio_array = np.asarray(audio)
-      if audio_array.ndim != 1:
-         audio_array = np.squeeze(audio_array)
-      if audio_array.ndim != 1:
-         raise ValueError("Audio must be a 1-D mono waveform array")
+    def transcribe(self, audio: object) -> Iterable[ASRSegment]:
+        if audio is None:
+            return []
 
-      audio_array = audio_array.astype(np.float32, copy=False)
+        audio_array = np.asarray(audio)
+        if audio_array.ndim != 1:
+            audio_array = np.squeeze(audio_array)
+        if audio_array.ndim != 1:
+            raise ValueError("Audio must be a 1-D mono waveform array")
 
-      transcript = self._transcriber.transcribe_without_streaming(audio_array)
+        audio_array = audio_array.astype(np.float32, copy=False)
 
-      lines = getattr(transcript, "lines", None)
-      if isinstance(lines, list):
-         segments: list[ASRSegment] = []
-         for line in lines:
-            text = str(getattr(line, "text", "") or "").strip()
-            if text:
-               segments.append(ASRSegment(text=text))
-         return segments
+        segments, _info = self._model.transcribe(
+            audio_array,
+            language=self._language,  # None = auto-detect
+            task="transcribe",        # always transcribe, never translate
+            beam_size=5,
+        )
 
-      text = str(getattr(transcript, "text", transcript) or "").strip()
-      if not text:
-         return []
-      return [ASRSegment(text=text)]
-
-
-   
+        return [ASRSegment(text=seg.text.strip()) for seg in segments if seg.text.strip()]
