@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_EXPENSE_VND = 50000
-_CATEGORY_LLM_FALLBACK_THRESHOLD = 0.25
+_CATEGORY_LLM_FALLBACK_THRESHOLD = 0.5
 
 
 def _parse_expense_number(raw: str | None) -> int:
@@ -650,6 +650,7 @@ async def _process_one(
       result_key = f"job:{job.job_id}"
       payload = {
           "jobId": job.job_id,
+          "userId": job.user_id,
           "text": extracted_text,
           "expense": abs(expense) if expense else _DEFAULT_EXPENSE_VND, 
           "type": transaction_type or "EXPENSE",
