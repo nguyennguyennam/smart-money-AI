@@ -7,13 +7,14 @@ from catboost import CatBoostRegressor
 
 CATEGORY_COLS = [
     "FOOD",
-    "TRANSPORT",
-    "SHOPPING",
-    "ENTERTAINMENT",
+    "TRANSPORTATION",
+    "CLOTHING",
     "UTILITIES",
+    "ENTERTAINMENT",
     "HEALTH",
     "EDUCATION",
-    "OTHER",
+    "SHOPPING",
+    "OTHER"
 ]
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -28,6 +29,8 @@ class BudgetPredictor:
 
         with open(METADATA_PATH, "r", encoding="utf-8") as f:
             self.metadata = json.load(f)
+
+        self.category_cols = self.metadata.get("category_cols", CATEGORY_COLS)
 
     def validate_profile(self, profile: dict):
         for col in self.metadata["categorical_cols"]:
@@ -57,7 +60,8 @@ class BudgetPredictor:
         current_sum = sum(amounts.values())
         delta = total_budget - current_sum
 
-        amounts["OTHER"] += delta
+        correction_category = self.category_cols[-1]
+        amounts[correction_category] += delta
 
         return amounts
     
@@ -77,14 +81,16 @@ class BudgetPredictor:
 
         amounts = {}
 
-        for i, category in enumerate(CATEGORY_COLS):
+        for i, category in enumerate(self.category_cols):
+            if i >= len(ratios):
+                break
             amounts[category] = self.round_money(ratios[i] * total_budget)
 
         amounts = self.fix_total_sum(amounts, total_budget)
 
         categories = []
 
-        for category in CATEGORY_COLS:
+        for category in self.category_cols:
             categories.append({
                 "category": category,
                 "ratio": round(amounts[category] /total_budget, 4),

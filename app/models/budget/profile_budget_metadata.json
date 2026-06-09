@@ -1,23 +1,25 @@
 {
-  "model_version": "PROFILE_BASED_CATBOOST",
+  "model_version": "PROFILE_BASED_CATBOOST_V2_9_CATEGORIES",
   "category_cols": [
     "FOOD",
-    "TRANSPORT",
-    "SHOPPING",
-    "ENTERTAINMENT",
+    "TRANSPORTATION",
+    "CLOTHING",
     "UTILITIES",
+    "ENTERTAINMENT",
     "HEALTH",
     "EDUCATION",
+    "SHOPPING",
     "OTHER"
   ],
   "target_cols": [
     "FOOD_ratio",
-    "TRANSPORT_ratio",
-    "SHOPPING_ratio",
-    "ENTERTAINMENT_ratio",
+    "TRANSPORTATION_ratio",
+    "CLOTHING_ratio",
     "UTILITIES_ratio",
+    "ENTERTAINMENT_ratio",
     "HEALTH_ratio",
     "EDUCATION_ratio",
+    "SHOPPING_ratio",
     "OTHER_ratio"
   ],
   "feature_cols": [
