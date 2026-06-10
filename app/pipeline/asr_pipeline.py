@@ -1,140 +1,66 @@
 from __future__ import annotations
 
-import os
-import subprocess
-import tempfile
 from typing import Any
 
-import numpy as np
-import imageio_ffmpeg
-
-from app.services.extractor.voice import noise_reduce, volume_normalize, audio_quality
-from ..models.asr_model import ASRModel
+from app.services.llm import get_llm_service
 
 
-def _suffix_from_content_type(content_type: str | None) -> str:
+_EXT_FROM_CONTENT_TYPE = {
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/wave": "wav",
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/mp4": "m4a",
+    "audio/m4a": "m4a",
+    "audio/x-m4a": "m4a",
+    "audio/ogg": "ogg",
+    "application/ogg": "ogg",
+    "audio/flac": "flac",
+    "audio/webm": "webm",
+    "audio/aac": "aac",
+}
+
+
+def filename_from_content_type(content_type: str | None) -> str:
     if not content_type:
-        return ".bin"
-
+        return "audio.mp3"
     ct = content_type.split(";")[0].strip().lower()
-    # Common audio content-types from Cloudinary
-    if ct in {"audio/wav", "audio/x-wav", "audio/wave"}:
-        return ".wav"
-    if ct in {"audio/mpeg", "audio/mp3"}:
-        return ".mp3"
-    if ct in {"audio/mp4", "audio/m4a", "audio/x-m4a"}:
-        return ".m4a"
-    if ct in {"audio/ogg", "application/ogg"}:
-        return ".ogg"
-    if ct in {"audio/flac"}:
-        return ".flac"
-    return ".bin"
-
-
-def load_audio_any(voice: Any, content_type: str | None = None) -> tuple[np.ndarray, int]:
-    """Load audio as mono float array at 16kHz.
-
-    Supports:
-    - bytes/bytearray/memoryview (worker)
-    - file-like objects with .read() (UploadFile.file)
-    - filesystem paths
-    """
-    def _decode_with_ffmpeg(path: str) -> tuple[np.ndarray, int]:
-        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-        # Decode to mono 16kHz float32 stream.
-        cmd = [
-            ffmpeg,
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            path,
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-f",
-            "f32le",
-            "pipe:1",
-        ]
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if p.returncode != 0:
-            err = p.stderr.decode("utf-8", errors="replace").strip()
-            raise ValueError(f"ffmpeg decode failed: {err}")
-
-        audio = np.frombuffer(p.stdout, dtype=np.float32)
-        return audio, 16000
-
-    # 1) bytes-like => decode via temp file (robust across formats)
-    if isinstance(voice, (bytes, bytearray, memoryview)):
-        data = bytes(voice)
-        suffix = _suffix_from_content_type(content_type)
-        tmp_path: str | None = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-                tmp_path = f.name
-                f.write(data)
-            return _decode_with_ffmpeg(tmp_path)
-        finally:
-            if tmp_path:
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
-
-    # 2) file-like object: ensure we're at start
-    if hasattr(voice, "read"):
-        try:
-            if hasattr(voice, "seek"):
-                voice.seek(0)
-        except Exception:
-            pass
-        # Read all bytes and reuse bytes-path decoder.
-        data = voice.read()
-        return load_audio_any(data, content_type)
-
-    # 3) path-like (str/Path)
-    return _decode_with_ffmpeg(str(voice))
-
-
-def _load_audio_any(voice: Any, content_type: str | None) -> tuple[np.ndarray, int]:
-    # Backward-compatible alias; prefer load_audio_any().
-    return load_audio_any(voice, content_type)
+    ext = _EXT_FROM_CONTENT_TYPE.get(ct, "mp3")
+    return f"audio.{ext}"
 
 
 class ASRPipeline:
-    def __init__(self, model):
-        self.model = ASRModel()
+    """Thin orchestrator that hands raw audio bytes to the transcribe LLM call.
 
-    def run(self, voice: Any, content_type: str | None = None):
-        try:
-            audio_array, _sr = load_audio_any(voice, content_type)
-        except ValueError as e:
-            return {"error": f"Could not decode audio: {e}", "text": ""}
+    No local decoding / noise reduction / volume normalization — the model
+    handles raw audio formats supported by OpenAI directly.
+    """
 
-        if audio_array.size == 0:
+    def __init__(self, model=None):
+        self.model = model
+
+    async def run(self, voice: Any, content_type: str | None = None) -> dict:
+        if voice is None:
+            return {"error": "Empty file", "text": ""}
+
+        if not isinstance(voice, (bytes, bytearray, memoryview)):
+            return {"error": "Audio payload must be bytes", "text": ""}
+
+        data = bytes(voice)
+        if not data:
             return {"error": "Audio file is empty or has no content", "text": ""}
 
-        # Minimum 0.5 s at 16 kHz — anything shorter is not meaningful speech
-        if audio_array.size < 8000:
-            return {"error": "Audio is too short to transcribe", "text": ""}
+        llm = get_llm_service()
+        filename = filename_from_content_type(content_type)
 
-        audio_array = audio_quality.enhance_audio_quality(audio_array)
-        # pedalboard returns 2D (channels, samples) for mono input — squeeze to 1D
-        if audio_array.ndim > 1:
-            audio_array = np.squeeze(audio_array)
+        try:
+            text = await llm.transcribe(data, filename=filename)
+        except Exception as e:
+            return {"error": f"Transcription failed: {e}", "text": ""}
 
-        audio_array = noise_reduce.reduce_noise(audio_array)
-        audio_array = volume_normalize.normalize_volume(audio_array, volume=0.3)
-
-        if audio_array.size == 0 or np.abs(audio_array).max() < 0.01:
-            return {"error": "Audio is too quiet or has no content", "text": ""}
-
-        segments = self.model.transcribe(audio_array)
-        text = " ".join([seg.text for seg in segments])
-
-        if not text.strip():
+        text = (text or "").strip()
+        if not text:
             return {"error": "No speech detected in audio", "text": ""}
 
         return {"error": None, "text": text}

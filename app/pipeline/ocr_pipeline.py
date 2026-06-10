@@ -1,10 +1,18 @@
 import numpy as np
 from PIL import ImageOps
-from ..services.extractor.image.pre_processing import blur_image, resize
+from ..services.extractor.image.pre_processing import blur_image
+
 
 class OCRPipeline:
+    """Cheap guards before sending an image to the OCR LLM call.
 
-    def __init__(self, model):
+    No longer runs a local OCR model — the actual OCR is performed by
+    `LLMService.generate_with_image` in the worker. This pipeline only filters
+    out blank or blurry images so we do not spend an API call on garbage.
+    """
+
+    def __init__(self, model=None):
+        # `model` kept for backwards-compatible constructor signature.
         self.model = model
 
     def run(self, img):
@@ -13,17 +21,11 @@ class OCRPipeline:
 
         # Blank / uniform image (white, black, solid colour) — no content to OCR
         if arr.std() < 8.0:
-            return {"error": "Image has no content (blank or uniform colour)", "text": ""}
+            return {"error": "Image has no content (blank or uniform colour)", "ok": False}
 
         # Blurry image — Laplacian variance below threshold
         _lap, is_blur, _var = blur_image.is_blur(arr)
         if is_blur:
-            return {"error": "Image is too blurry to read", "text": ""}
+            return {"error": "Image is too blurry to read", "ok": False}
 
-        processed = resize.pre_process_image(grayscale)
-        result = self.model.predict(processed)
-
-        if not result or not str(result).strip():
-            return {"error": "No text found in image", "text": ""}
-
-        return {"error": None, "text": result}
+        return {"error": None, "ok": True}

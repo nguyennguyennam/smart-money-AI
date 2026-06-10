@@ -64,7 +64,7 @@ async def _extract_expense_vnd(llm_service, bill_text_vi: str) -> int:
     )
 
     try:
-        out = await llm_service.generate(prompt=prompt, provider="gemini")
+        out = await llm_service.generate(prompt=prompt, provider="openai")
     except Exception:
         return _DEFAULT_EXPENSE_VND
 
@@ -90,11 +90,11 @@ async def _classify_category_with_llm(llm_service, text_vi: str) -> str | None:
         "```\n"
         f"{text_vi}\n"
         "```\n\n"
-        "Chỉ trả về một nhãn danh mục:" 
+        "Chỉ trả về một nhãn danh mục:"
     )
 
     try:
-        out = await llm_service.generate(prompt=prompt, provider="gemini")
+        out = await llm_service.generate(prompt=prompt, provider="openai")
     except Exception:
         return None
 
@@ -134,7 +134,7 @@ async def _classify_transaction_type(llm_service, text_vi: str) -> str | None:
     )
 
     try:
-        out = await llm_service.generate(prompt=prompt, provider="gemini")
+        out = await llm_service.generate(prompt=prompt, provider="openai")
     except Exception:
         return None
 
@@ -142,7 +142,7 @@ async def _classify_transaction_type(llm_service, text_vi: str) -> str | None:
         return None
 
     out_norm = str(out).strip().upper()
-    
+
     # Check for exact match
     if out_norm == "EXPENSE":
         return "EXPENSE"
@@ -460,30 +460,14 @@ async def _publish_extraction_error(
     else:
         await result_redis.set(result_key, json.dumps(payload, ensure_ascii=False))
     await input_redis.xack(stream_key, group, message_id)
-async def _handle_ocr_duty(image_extractor, download) -> str:
-    """Extract text from image using OCR."""
-    ocr_result = await image_extractor.extract_bytes(download.content)
-    if ocr_result.get("error"):
-        raise RuntimeError(str(ocr_result.get("error")))
-    return str(ocr_result.get("text") or "")
-
-
-async def _handle_voice_duty(voice_extractor, download) -> str:
-    """Extract text from audio using ASR."""
-    asr_result = await voice_extractor.extract_bytes(
-        download.content, content_type=download.content_type
-    )
-    if asr_result.get("error"):
-        raise RuntimeError(str(asr_result.get("error")))
-    return str(asr_result.get("text") or "")
 
 
 async def _handle_notification_duty(fields: dict[str, str]) -> str:
     """Extract text from notification (text is already provided)."""
     # Check multiple possible field names
     text = (
-        fields.get("text") 
-        or fields.get("message") 
+        fields.get("text")
+        or fields.get("message")
         or fields.get("data")
         or ""
     )
@@ -525,27 +509,6 @@ def _extract_amount_from_notification(text: str) -> int | None:
 
     return None
 
-async def _extract_text_by_duty(
-    job: JobEvent,
-    download,
-    image_extractor,
-    voice_extractor,
-    fields: dict[str, str],
-) -> str:
-    """Route to appropriate handler based on duty type."""
-    duty_lower = job.duty.lower()
-    
-    duty_handlers = {
-        "ocr": lambda: _handle_ocr_duty(image_extractor, download),
-        "voice": lambda: _handle_voice_duty(voice_extractor, download),
-        "notification": lambda: _handle_notification_duty(fields),
-    }
-    
-    if duty_lower not in duty_handlers:
-        raise ValueError(f"Unsupported duty: {job.duty}")
-    
-    return await duty_handlers[duty_lower]()
-
 
 async def _process_one(
     input_redis: redis.Redis,
@@ -567,20 +530,81 @@ async def _process_one(
           logger.info("Skipped init message id=%s", message_id)
           return
 
+      duty_lower = job.duty.lower()
       download = None
 
-      if job.duty.lower() in ("ocr", "voice"):
+      if duty_lower in ("ocr", "voice"):
           enhanced_url = enhance_cloudinary_url(job.file_url)
           download = await fetcher.fetch(enhanced_url)
 
-      try:
-          extracted_text = await _extract_text_by_duty(
-              job,
-              download,
-              image_extractor,
-              voice_extractor,
-              fields,
+      # ── OCR: one gpt-5-nano vision call returns text + category + type + expense
+      if duty_lower == "ocr":
+          analysis = await image_extractor.analyze_bytes(download.content)
+          extracted_text = str(analysis.get("text") or "")
+          if analysis.get("error") or not extracted_text.strip():
+              await _publish_extraction_error(
+                  input_redis,
+                  result_redis,
+                  stream_key,
+                  group,
+                  message_id,
+                  job.job_id,
+                  str(analysis.get("error") or "No readable text content found in the uploaded file"),
+              )
+              return
+
+          payload = {
+              "jobId": job.job_id,
+              "userId": job.user_id,
+              "text": extracted_text,
+              "expense": abs(int(analysis.get("expense") or _DEFAULT_EXPENSE_VND)) or _DEFAULT_EXPENSE_VND,
+              "type": str(analysis.get("type") or "EXPENSE"),
+              "category": str(analysis.get("category") or "OTHER"),
+              "confidence": 1.0,
+          }
+
+          await _publish_result(result_redis, job.job_id, payload)
+          await input_redis.xack(stream_key, group, message_id)
+          return
+
+      # ── Voice: gpt-4o-mini-transcribe → gpt-5-nano classify+extract
+      if duty_lower == "voice":
+          asr_result = await voice_extractor.extract_bytes(
+              download.content, content_type=download.content_type
           )
+          extracted_text = str(asr_result.get("text") or "")
+          if asr_result.get("error") or not extracted_text.strip():
+              await _publish_extraction_error(
+                  input_redis,
+                  result_redis,
+                  stream_key,
+                  group,
+                  message_id,
+                  job.job_id,
+                  str(asr_result.get("error") or "No readable text content found in the uploaded file"),
+              )
+              return
+
+          from app.services.llm.financial import classify_and_extract
+
+          analysis = await classify_and_extract(llm_service, extracted_text)
+          payload = {
+              "jobId": job.job_id,
+              "userId": job.user_id,
+              "text": extracted_text,
+              "expense": abs(int(analysis.get("expense") or _DEFAULT_EXPENSE_VND)) or _DEFAULT_EXPENSE_VND,
+              "type": str(analysis.get("type") or "EXPENSE"),
+              "category": str(analysis.get("category") or "OTHER"),
+              "confidence": 1.0,
+          }
+
+          await _publish_result(result_redis, job.job_id, payload)
+          await input_redis.xack(stream_key, group, message_id)
+          return
+
+      # ── Notification: text already provided; keep regex + classifier cascade
+      try:
+          extracted_text = await _handle_notification_duty(fields)
       except Exception as e:
           await _publish_extraction_error(
               input_redis,
@@ -605,25 +629,13 @@ async def _process_one(
           )
           return
 
-      if job.duty.lower() == "notification":
-          expense = _extract_amount_from_notification(extracted_text)
-
-          if expense is None:
-              expense = await _extract_expense_vnd(
-                  llm_service,
-                  extracted_text,
-              )
-      else:
-          expense = await _extract_expense_vnd(
-              llm_service,
-              extracted_text,
-          )
+      expense = _extract_amount_from_notification(extracted_text)
+      if expense is None:
+          expense = await _extract_expense_vnd(llm_service, extracted_text)
 
       transaction_type = _detect_transaction_type_rule(extracted_text)
-
       if not transaction_type:
           transaction_type = await _classify_transaction_type(llm_service, extracted_text)
-
       if not transaction_type:
           transaction_type = "EXPENSE"
 
@@ -649,31 +661,29 @@ async def _process_one(
           if llm_category:
               final_category = llm_category
 
-      result_key = f"job:{job.job_id}"
       payload = {
           "jobId": job.job_id,
           "userId": job.user_id,
           "text": extracted_text,
-          "expense": abs(expense) if expense else _DEFAULT_EXPENSE_VND, 
+          "expense": abs(expense) if expense else _DEFAULT_EXPENSE_VND,
           "type": transaction_type or "EXPENSE",
           "category": final_category,
           "confidence": confidence,
       }
 
-
-      await result_redis.xadd("result_stream", payload, maxlen=10000, approximate=True)
-
-      ttl = int(settings.RESULT_TTL_SECONDS)
-      if ttl > 0:
-          await result_redis.setex(
-              result_key,
-              ttl,
-              json.dumps(payload, ensure_ascii=False),
-          )
-      else:
-          await result_redis.set(result_key, json.dumps(payload, ensure_ascii=False))
-
+      await _publish_result(result_redis, job.job_id, payload)
       await input_redis.xack(stream_key, group, message_id)
+
+
+async def _publish_result(result_redis: redis.Redis, job_id: str, payload: dict) -> None:
+    await result_redis.xadd("result_stream", payload, maxlen=10000, approximate=True)
+
+    result_key = f"job:{job_id}"
+    ttl = int(settings.RESULT_TTL_SECONDS)
+    if ttl > 0:
+        await result_redis.setex(result_key, ttl, json.dumps(payload, ensure_ascii=False))
+    else:
+        await result_redis.set(result_key, json.dumps(payload, ensure_ascii=False))
 
 
 async def run_worker_forever() -> None:

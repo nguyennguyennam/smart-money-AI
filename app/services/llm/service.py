@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 from enum import Enum
 from functools import lru_cache
 from typing import Any
@@ -108,6 +110,70 @@ class LLMService:
             return text.strip()
 
         return str(result)
+
+    async def generate_with_image(
+        self,
+        prompt: str,
+        image_bytes: bytes,
+        mime_type: str,
+        model: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        if self._openai_client is None:
+            raise ValueError("OPENAI_API_KEY is not set")
+        if not image_bytes:
+            raise ValueError("image_bytes must not be empty")
+
+        target_model = model or settings.OPENAI_VISION_MODEL
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        data_url = f"data:{mime_type};base64,{b64}"
+
+        response = await self._openai_client.chat.completions.create(
+            model=target_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }
+            ],
+            **kwargs,
+        )
+
+        if not response.choices:
+            return ""
+
+        message = response.choices[0].message
+        return (message.content or "").strip()
+
+    async def transcribe(
+        self,
+        audio_bytes: bytes,
+        filename: str,
+        model: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        if self._openai_client is None:
+            raise ValueError("OPENAI_API_KEY is not set")
+        if not audio_bytes:
+            raise ValueError("audio_bytes must not be empty")
+
+        target_model = model or settings.OPENAI_TRANSCRIBE_MODEL
+        # OpenAI SDK accepts a (filename, fileobj) tuple for `file`.
+        file_tuple = (filename, io.BytesIO(audio_bytes))
+
+        response = await self._openai_client.audio.transcriptions.create(
+            model=target_model,
+            file=file_tuple,
+            **kwargs,
+        )
+
+        text = getattr(response, "text", None)
+        if isinstance(text, str):
+            return text.strip()
+        return str(response).strip()
     
 
 @lru_cache(maxsize=1)
