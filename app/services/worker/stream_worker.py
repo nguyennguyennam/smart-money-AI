@@ -781,109 +781,109 @@ async def run_worker_forever() -> None:
 
         message_id, fields = item
 
-try:
-    logger.warning("RAW STREAM MESSAGE id=%s fields=%s", message_id, fields)
-    logger.warning(
-        "CURRENT PROCESS consumer=%s pid=%s stream=%s group=%s",
-        consumer_name,
-        os.getpid(),
-        stream_key,
-        group,
-    )
+        try:
+            logger.warning("RAW STREAM MESSAGE id=%s fields=%s", message_id, fields)
+            logger.warning(
+                "CURRENT PROCESS consumer=%s pid=%s stream=%s group=%s",
+                consumer_name,
+                os.getpid(),
+                stream_key,
+                group,
+            )
 
-    # Skip init messages (from feat/budget-allocation)
-    if fields.get("init") in ("true", '"true"'):
-        logger.warning("Skip invalid stream message id=%s fields=%s", message_id, fields)
-        await input_redis.xack(stream_key, group, message_id)
-        continue
+            # Skip init messages (from feat/budget-allocation)
+            if fields.get("init") in ("true", '"true"'):
+                logger.warning("Skip invalid stream message id=%s fields=%s", message_id, fields)
+                await input_redis.xack(stream_key, group, message_id)
+                continue
 
-    duty = (fields.get("duty") or "").strip().upper()
+            duty = (fields.get("duty") or "").strip().upper()
 
-    # Dispatch based on duty type (budget allocation added in feat/budget-allocation)
-    if duty == "BUDGET_ALLOCATION_PLAN":
-        await _process_budget_allocation_one(
-            input_redis=input_redis,
-            result_redis=result_redis,
-            predictor=budget_predictor,
-            stream_key=stream_key,
-            group=group,
-            message_id=message_id,
-            fields=fields,
-        )
-    else:
-        await _process_one(
-            input_redis,
-            result_redis,
-            fetcher,
-            classifier,
-            image_extractor,
-            voice_extractor,
-            llm_service,
-            stream_key,
-            group,
-            message_id,
-            fields,
-        )
+            # Dispatch based on duty type (budget allocation added in feat/budget-allocation)
+            if duty == "BUDGET_ALLOCATION_PLAN":
+                await _process_budget_allocation_one(
+                    input_redis=input_redis,
+                    result_redis=result_redis,
+                    predictor=budget_predictor,
+                    stream_key=stream_key,
+                    group=group,
+                    message_id=message_id,
+                    fields=fields,
+                )
+            else:
+                await _process_one(
+                    input_redis,
+                    result_redis,
+                    fetcher,
+                    classifier,
+                    image_extractor,
+                    voice_extractor,
+                    llm_service,
+                    stream_key,
+                    group,
+                    message_id,
+                    fields,
+                )
 
-    logger.info(
-        "Processed job stream id=%s jobId=%s duty=%s",
-        message_id,
-        fields.get("jobId"),
-        duty,
-    )
+            logger.info(
+                "Processed job stream id=%s jobId=%s duty=%s",
+                message_id,
+                fields.get("jobId"),
+                duty,
+            )
 
-# Handle malformed messages (ValueError added in feat/redis_consumer)
-except ValueError as e:
-    err = str(e)
-    logger.exception(
-        "Malformed message stream id=%s error=%s",
-        message_id,
-        err,
-    )
-    await _dead_letter(
-        input_redis,
-        settings.REDIS_DEAD_LETTER_STREAM_KEY,
-        stream_key,
-        message_id,
-        fields,
-        err,
-    )
-    await input_redis.xack(stream_key, group, message_id)
-    continue
+        # Handle malformed messages (ValueError added in feat/redis_consumer)
+        except ValueError as e:
+            err = str(e)
+            logger.exception(
+                "Malformed message stream id=%s error=%s",
+                message_id,
+                err,
+            )
+            await _dead_letter(
+                input_redis,
+                settings.REDIS_DEAD_LETTER_STREAM_KEY,
+                stream_key,
+                message_id,
+                fields,
+                err,
+            )
+            await input_redis.xack(stream_key, group, message_id)
+            continue
 
-# Handle other processing errors (existing from both branches)
-except Exception as e:
-    err = str(e)
-    job_id = fields.get("jobId")
-    times_delivered = await _times_delivered(
-        input_redis,
-        stream_key,
-        group,
-        message_id,
-    )
-    logger.exception(
-        "Failed processing stream id=%s jobId=%s delivered=%s error=%s",
-        message_id,
-        job_id,
-        times_delivered,
-        err,
-    )
-    max_retries = int(settings.REDIS_MAX_RETRIES)
-    if (
-        times_delivered is not None
-        and max_retries > 0
-        and times_delivered >= max_retries
-    ):
-        await _dead_letter(
-            input_redis,
-            settings.REDIS_DEAD_LETTER_STREAM_KEY,
-            stream_key,
-            message_id,
-            fields,
-            err,
-        )
-        await input_redis.xack(stream_key, group, message_id)
-     await asyncio.sleep(0.5)
+        # Handle other processing errors (existing from both branches)
+        except Exception as e:
+            err = str(e)
+            job_id = fields.get("jobId")
+            times_delivered = await _times_delivered(
+                input_redis,
+                stream_key,
+                group,
+                message_id,
+            )
+            logger.exception(
+                "Failed processing stream id=%s jobId=%s delivered=%s error=%s",
+                message_id,
+                job_id,
+                times_delivered,
+                err,
+            )
+            max_retries = int(settings.REDIS_MAX_RETRIES)
+            if (
+                times_delivered is not None
+                and max_retries > 0
+                and times_delivered >= max_retries
+            ):
+                await _dead_letter(
+                    input_redis,
+                    settings.REDIS_DEAD_LETTER_STREAM_KEY,
+                    stream_key,
+                    message_id,
+                    fields,
+                    err,
+                )
+                await input_redis.xack(stream_key, group, message_id)
+            await asyncio.sleep(0.5)
 
 
 # Budget
