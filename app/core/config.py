@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     # Redis (result storage) — can be a separate instance/host.
     # Default points to a separate logical DB for convenience.
     REDIS_RESULT_URL: str = "redis://localhost:6379/1"
+    REDIS_RESULT_STREAM_KEY: str = "result_stream"
     RESULT_TTL_SECONDS: int = 180  #  3 mins
 
     # Download limits

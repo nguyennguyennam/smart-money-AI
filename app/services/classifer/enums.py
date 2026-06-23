@@ -9,6 +9,7 @@ class Category(str, Enum):
     ENTERTAINMENT = "ENTERTAINMENT"
     HEALTH = "HEALTH"
     EDUCATION = "EDUCATION"
+    SHOPPING = "SHOPPING"
     OTHER = "OTHER"
 
 
