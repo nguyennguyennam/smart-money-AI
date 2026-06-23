@@ -1,10 +1,10 @@
 # app/services/context.py
 
 from fastapi import UploadFile
-from core.enums import InputType
-from services.extractor.base import BaseExtractor
-from services.extractor.image_extractor import ImageExtractor
-from services.extractor.voice_extractor import VoiceExtractor
+from app.core.enums import InputType
+from app.services.extractor.base import BaseExtractor
+from app.services.extractor.image_extractor import ImageExtractor
+from app.services.extractor.voice_extractor import VoiceExtractor
 
 
 class Context:

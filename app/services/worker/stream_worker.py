@@ -6,9 +6,10 @@ import logging
 import os
 import re
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any
 
+from app.services.extractor import context
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_EXPENSE_VND = 50000
 _CATEGORY_LLM_FALLBACK_THRESHOLD = 0.5
+
 
 
 def _parse_expense_number(raw: str | None) -> int:
@@ -45,6 +47,7 @@ def _parse_expense_number(raw: str | None) -> int:
         return _DEFAULT_EXPENSE_VND
 
     return n if n > 0 else _DEFAULT_EXPENSE_VND
+
 
 
 async def _extract_expense_vnd(llm_service, bill_text_vi: str) -> int:
@@ -269,9 +272,12 @@ def _parse_job(fields: dict[str, str]) -> JobEvent | None:
 
     # ✅ validate URL (skip for notification duty)
     duty_lower = duty.lower() if duty else ""
-    if duty_lower != "notification":
+    if duty_lower not in (
+        "notification",
+        "financial_assistant",
+    ):
         if not file_url or not file_url.startswith("http"):
-            raise ValueError(f"Invalid file_url: {file_url}")
+            raise ValueError("Invalid file_url")
 
     print(f"Parsed jobId={job_id} file_url={file_url} duty={duty}")
 
@@ -493,6 +499,87 @@ async def _handle_notification_duty(fields: dict[str, str]) -> str:
         )
     return str(text)
 
+async def _handle_financial_assistant_duty(
+    llm_service,
+    fields: dict[str, str],
+) -> str:
+
+    raw = fields.get("data")
+
+    if not raw:
+        raise ValueError("Missing assistant context")
+
+    context = json.loads(raw)
+
+    context_json = json.dumps(context, ensure_ascii=False)
+
+
+    prompt = f"""
+    Bạn là Financial Coach của SmartMoney.
+
+    Dữ liệu:
+    {context_json}
+
+    NHIỆM VỤ:
+
+    1. spendingSummary
+    - So sánh currentWeek.totalExpense với previousWeek.totalExpense.
+
+    - Nếu currentWeek.totalExpense = 0:
+    => nói ngắn gọn rằng chưa có giao dịch tuần này.
+
+    - Nếu currentWeek.totalExpense > previousWeek.totalExpense:
+    => tính % tăng và nêu ngắn gọn.
+
+    - Nếu currentWeek.totalExpense <= previousWeek.totalExpense:
+    => "Bạn đang chi tiêu hợp lý so với tuần trước."
+
+    - state:
+    + Tăng chi tiêu => "Negative"
+    + Không tăng => "Positive"
+
+    ------------------------------------
+
+    2. savingSummary
+    - Tính tổng savingGap.
+
+    - Nếu totalSavingGap > 0:
+    => "Bạn đang thiếu X VNĐ..."
+
+    - Nếu = 0:
+    => "Bạn đang đi đúng kế hoạch tiết kiệm."
+
+    - state:
+    + Thiếu tiền => "Negative"
+    + Đúng kế hoạch => "Positive"
+
+    ------------------------------------
+
+    YÊU CẦU:
+    - Mỗi summary tối đa 80 ký tự.
+    - Không markdown.
+    - Không giải thích thêm.
+    - Chỉ trả về JSON.
+
+    JSON:
+
+    {{
+    "spending": {{
+        "text": "...",
+        "state": "Positive | Negative"
+    }},
+    "saving": {{
+        "text": "...",
+        "state": "Positive | Negative"
+    }}
+    }}
+    """
+
+    return await llm_service.generate(
+        prompt=prompt,
+        provider="gemini",
+    )
+
 def _extract_amount_from_notification(text: str) -> int | None:
     if not text:
         return None
@@ -531,6 +618,7 @@ async def _extract_text_by_duty(
     image_extractor,
     voice_extractor,
     fields: dict[str, str],
+    llm_service=None,
 ) -> str:
     """Route to appropriate handler based on duty type."""
     duty_lower = job.duty.lower()
@@ -539,6 +627,7 @@ async def _extract_text_by_duty(
         "ocr": lambda: _handle_ocr_duty(image_extractor, download),
         "voice": lambda: _handle_voice_duty(voice_extractor, download),
         "notification": lambda: _handle_notification_duty(fields),
+        "financial_assistant": lambda: _handle_financial_assistant_duty(llm_service, fields),
     }
     
     if duty_lower not in duty_handlers:
@@ -546,6 +635,50 @@ async def _extract_text_by_duty(
     
     return await duty_handlers[duty_lower]()
 
+async def _process_financial_assistant(
+    input_redis,
+    result_redis,
+    llm_service,
+    stream_key,
+    group,
+    message_id,
+    fields,
+):
+    job_id = fields["jobId"]
+    user_id = fields["userId"]
+
+    result = await _handle_financial_assistant_duty(
+        llm_service,
+        fields,
+    )
+
+    payload = {
+        "jobId": job_id,
+        "userId": user_id,
+        "duty": "FINANCIAL_ASSISTANT",
+        "status": "COMPLETED",
+        "type": "FINANCIAL_ASSISTANT_RESULT",
+        "result": result,
+    }
+
+    await result_redis.xadd(
+        "result_stream",
+        payload,
+        maxlen=10000,
+        approximate=True,
+    )
+
+    await result_redis.setex(
+        f"job:{job_id}",
+        settings.RESULT_TTL_SECONDS,
+        json.dumps(payload, ensure_ascii=False),
+    )
+
+    await input_redis.xack(
+        stream_key,
+        group,
+        message_id,
+    )
 
 async def _process_one(
     input_redis: redis.Redis,
@@ -573,6 +706,18 @@ async def _process_one(
           enhanced_url = enhance_cloudinary_url(job.file_url)
           download = await fetcher.fetch(enhanced_url)
 
+      if job.duty.lower() == "financial_assistant":
+          await _process_financial_assistant(
+             input_redis=input_redis,
+             result_redis=result_redis,
+             llm_service=llm_service,
+             stream_key=stream_key,
+             group=group,
+             message_id=message_id,
+             fields=fields,
+            )
+          return
+
       try:
           extracted_text = await _extract_text_by_duty(
               job,
@@ -580,6 +725,7 @@ async def _process_one(
               image_extractor,
               voice_extractor,
               fields,
+              llm_service=llm_service,
           )
       except Exception as e:
           await _publish_extraction_error(

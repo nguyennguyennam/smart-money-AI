@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str | None = None
     GEMINI_MODEL: str = "gemini-2.0-flash"
 
+    NVIDIA_API_KEY: str | None = None
+    NVIDIA_MODEL: str = "nvidia-deepseek-v4-pro"
+
+    DEEPSEEK_API_KEY: str | None = None
+    OPENROUTER_API_KEY: str | None = None
+
     class Config:
         env_file = ".env"
         file_encoding = "utf-8"
