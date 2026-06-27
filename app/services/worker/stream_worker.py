@@ -6,9 +6,11 @@ import logging
 import os
 import re
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any
+from urllib.parse import urlparse
 
+from app.services.extractor import context
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
@@ -19,9 +21,31 @@ from app.services.budget.budget_predictor import BudgetPredictor
 
 logger = logging.getLogger(__name__)
 
+WORKER_VERSION = "budget-v2-transportation-9-categories"
 
 _DEFAULT_EXPENSE_VND = 50000
 _CATEGORY_LLM_FALLBACK_THRESHOLD = 0.5
+
+
+def _result_stream_key() -> str:
+    return getattr(settings, "REDIS_RESULT_STREAM_KEY", "result_stream")
+
+
+def _decode_message_id(message_id: Any) -> str:
+    if isinstance(message_id, bytes):
+        return message_id.decode("utf-8", errors="replace")
+    return str(message_id)
+
+
+def _redis_url_info(url: str) -> dict[str, str]:
+    parsed = urlparse(url)
+    db = (parsed.path or "/0").lstrip("/") or "0"
+    return {
+        "host": parsed.hostname or "",
+        "port": str(parsed.port or 6379),
+        "db": db,
+        "ssl": str(parsed.scheme == "rediss").lower(),
+    }
 
 
 def _parse_expense_number(raw: str | None) -> int:
@@ -45,6 +69,7 @@ def _parse_expense_number(raw: str | None) -> int:
         return _DEFAULT_EXPENSE_VND
 
     return n if n > 0 else _DEFAULT_EXPENSE_VND
+
 
 
 async def _extract_expense_vnd(llm_service, bill_text_vi: str) -> int:
@@ -269,9 +294,12 @@ def _parse_job(fields: dict[str, str]) -> JobEvent | None:
 
     # ✅ validate URL (skip for notification duty)
     duty_lower = duty.lower() if duty else ""
-    if duty_lower != "notification":
+    if duty_lower not in (
+        "notification",
+        "financial_assistant",
+    ):
         if not file_url or not file_url.startswith("http"):
-            raise ValueError(f"Invalid file_url: {file_url}")
+            raise ValueError("Invalid file_url")
 
     print(f"Parsed jobId={job_id} file_url={file_url} duty={duty}")
 
@@ -451,8 +479,20 @@ async def _publish_extraction_error(
         "category": "OTHER",
         "confidence": 0.0,
     }
-    result_stream_key = getattr(settings, "REDIS_RESULT_STREAM_KEY", "result_stream")
-    await result_redis.xadd(result_stream_key, payload, maxlen=10000, approximate=True)
+    result_stream_key = _result_stream_key()
+    result_message_id = await result_redis.xadd(
+        result_stream_key,
+        payload,
+        maxlen=10000,
+        approximate=True,
+    )
+    logger.warning(
+        "ACTUAL XADD stream=%s message_id=%s job_id=%s payload=%s",
+        result_stream_key,
+        _decode_message_id(result_message_id),
+        job_id,
+        payload,
+    )
     result_key = f"job:{job_id}"
     ttl = int(settings.RESULT_TTL_SECONDS)
     if ttl > 0:
@@ -476,6 +516,87 @@ async def _handle_notification_duty(fields: dict[str, str]) -> str:
             f"Missing text/message/data in notification duty. Available fields: {list(fields.keys())}"
         )
     return str(text)
+
+async def _handle_financial_assistant_duty(
+    llm_service,
+    fields: dict[str, str],
+) -> str:
+
+    raw = fields.get("data")
+
+    if not raw:
+        raise ValueError("Missing assistant context")
+
+    context = json.loads(raw)
+
+    context_json = json.dumps(context, ensure_ascii=False)
+
+
+    prompt = f"""
+    Bạn là Financial Coach của SmartMoney.
+
+    Dữ liệu:
+    {context_json}
+
+    NHIỆM VỤ:
+
+    1. spendingSummary
+    - So sánh currentWeek.totalExpense với previousWeek.totalExpense.
+
+    - Nếu currentWeek.totalExpense = 0:
+    => nói ngắn gọn rằng chưa có giao dịch tuần này.
+
+    - Nếu currentWeek.totalExpense > previousWeek.totalExpense:
+    => tính % tăng và nêu ngắn gọn.
+
+    - Nếu currentWeek.totalExpense <= previousWeek.totalExpense:
+    => "Bạn đang chi tiêu hợp lý so với tuần trước."
+
+    - state:
+    + Tăng chi tiêu => "Negative"
+    + Không tăng => "Positive"
+
+    ------------------------------------
+
+    2. savingSummary
+    - Tính tổng savingGap.
+
+    - Nếu totalSavingGap > 0:
+    => "Bạn đang thiếu X VNĐ..."
+
+    - Nếu = 0:
+    => "Bạn đang đi đúng kế hoạch tiết kiệm."
+
+    - state:
+    + Thiếu tiền => "Negative"
+    + Đúng kế hoạch => "Positive"
+
+    ------------------------------------
+
+    YÊU CẦU:
+    - Mỗi summary tối đa 80 ký tự.
+    - Không markdown.
+    - Không giải thích thêm.
+    - Chỉ trả về JSON.
+
+    JSON:
+
+    {{
+    "spending": {{
+        "text": "...",
+        "state": "Positive | Negative"
+    }},
+    "saving": {{
+        "text": "...",
+        "state": "Positive | Negative"
+    }}
+    }}
+    """
+
+    return await llm_service.generate(
+        prompt=prompt,
+        provider="gemini",
+    )
 
 def _extract_amount_from_notification(text: str) -> int | None:
     if not text:
@@ -509,6 +630,51 @@ def _extract_amount_from_notification(text: str) -> int | None:
 
     return None
 
+async def _process_financial_assistant(
+    input_redis,
+    result_redis,
+    llm_service,
+    stream_key,
+    group,
+    message_id,
+    fields,
+):
+    job_id = fields["jobId"]
+    user_id = fields["userId"]
+
+    result = await _handle_financial_assistant_duty(
+        llm_service,
+        fields,
+    )
+
+    payload = {
+        "jobId": job_id,
+        "userId": user_id,
+        "duty": "FINANCIAL_ASSISTANT",
+        "status": "COMPLETED",
+        "type": "FINANCIAL_ASSISTANT_RESULT",
+        "result": result,
+    }
+
+    await result_redis.xadd(
+        "result_stream",
+        payload,
+        maxlen=10000,
+        approximate=True,
+    )
+
+    await result_redis.setex(
+        f"job:{job_id}",
+        settings.RESULT_TTL_SECONDS,
+        json.dumps(payload, ensure_ascii=False),
+    )
+
+    await input_redis.xack(
+        stream_key,
+        group,
+        message_id,
+    )
+
 
 async def _process_one(
     input_redis: redis.Redis,
@@ -536,6 +702,19 @@ async def _process_one(
       if duty_lower in ("ocr", "voice"):
           enhanced_url = enhance_cloudinary_url(job.file_url)
           download = await fetcher.fetch(enhanced_url)
+
+      # ── Financial assistant: LLM coaching summary, handled in its own helper
+      if duty_lower == "financial_assistant":
+          await _process_financial_assistant(
+              input_redis=input_redis,
+              result_redis=result_redis,
+              llm_service=llm_service,
+              stream_key=stream_key,
+              group=group,
+              message_id=message_id,
+              fields=fields,
+          )
+          return
 
       # ── OCR: one gpt-5-nano vision call returns text + category + type + expense
       if duty_lower == "ocr":
@@ -704,12 +883,29 @@ async def run_worker_forever() -> None:
     logger.info("CONFIG REDIS_STREAM_KEY=%s", stream_key)
     logger.info("CONFIG REDIS_CONSUMER_GROUP=%s", group)
     logger.info("CONFIG REDIS_CONSUMER_NAME=%s", consumer_name)
+    logger.info("CONFIG REDIS_RESULT_STREAM_KEY=%s", _result_stream_key())
 
     async def connect() -> tuple[redis.Redis, redis.Redis]:
         in_r = _redis_from_url_checked(settings.REDIS_STREAM_URL, "REDIS_STREAM_URL")
         out_r = _redis_from_url_checked(settings.REDIS_RESULT_URL, "REDIS_RESULT_URL")
         await in_r.ping()
         await out_r.ping()
+        in_info = _redis_url_info(settings.REDIS_STREAM_URL)
+        out_info = _redis_url_info(settings.REDIS_RESULT_URL)
+        logger.warning(
+            "AI INPUT REDIS host=%s port=%s db=%s ssl=%s",
+            in_info["host"],
+            in_info["port"],
+            in_info["db"],
+            in_info["ssl"],
+        )
+        logger.warning(
+            "AI RESULT REDIS host=%s port=%s db=%s ssl=%s",
+            out_info["host"],
+            out_info["port"],
+            out_info["db"],
+            out_info["ssl"],
+        )
         await _ensure_consumer_group(in_r, stream_key, group)
         return in_r, out_r
 
@@ -937,28 +1133,82 @@ async def _process_budget_allocation_one(
     message_id: str,
     fields: dict[str, str],
 ) -> None:
-    logger.warning("ENTER _process_budget_allocation_one fields=%s", fields)
+    logger.warning(
+        "ENTER _process_budget_allocation_one fields=%s",
+        fields,
+    )
 
     job_id, user_id, data = _parse_budget_payload(fields)
 
-    logger.warning("PARSED BUDGET job_id=%s user_id=%s data=%s", job_id, user_id, data)
+    logger.warning(
+        "PARSED BUDGET job_id=%s user_id=%s data=%s",
+        job_id,
+        user_id,
+        data,
+    )
 
     total_budget = int(data["safe_spending"])
-    currency = data.get("currency", "VND")
-    profile = data["user_profile"]
+    currency = str(data.get("currency", "VND"))
+    profile = data.get("user_profile")
 
-    logger.warning("CALLING BUDGET PREDICTOR total_budget=%s profile=%s", total_budget, profile)
+    if total_budget <= 0:
+        raise ValueError(
+            f"Invalid safe_spending for job {job_id}: "
+            f"{total_budget}"
+        )
+
+    if not isinstance(profile, dict) or not profile:
+        raise ValueError(
+            f"Missing or invalid user_profile for job {job_id}"
+        )
+
+    history_features = data.get("history_features")
+
+    # Không có history hoặc history rỗng:
+    # BudgetPredictor sẽ dùng profile model.
+    if not isinstance(history_features, dict) or not history_features:
+        history_features = None
+
+    logger.warning(
+        "CALLING BUDGET PREDICTOR "
+        "job_id=%s total_budget=%s "
+        "profile=%s has_history=%s "
+        "history_features=%s",
+        job_id,
+        total_budget,
+        profile,
+        history_features is not None,
+        history_features,
+    )
 
     prediction = predictor.predict(
         total_budget=total_budget,
         profile=profile,
+        history_features=history_features,
     )
 
-    logger.warning("BUDGET PREDICTION RESULT=%s", prediction)
+    model_version = prediction.get(
+        "modelVersion",
+        "UNKNOWN",
+    )
+
+    logger.warning(
+        "BUDGET PREDICTION RESULT "
+        "job_id=%s model_version=%s result=%s",
+        job_id,
+        model_version,
+        prediction,
+    )
 
     result = {
-        "totalBudget": total_budget,
+        "totalBudget": int(
+            prediction.get(
+                "totalBudget",
+                total_budget,
+            )
+        ),
         "currency": currency,
+        "modelVersion": model_version,
         "categories": prediction["categories"],
     }
 
@@ -968,40 +1218,94 @@ async def _process_budget_allocation_one(
         "duty": "BUDGET_ALLOCATION_PLAN",
         "status": "COMPLETED",
         "type": "BUDGET_ALLOCATION_RESULT",
-        "result": json.dumps(result, ensure_ascii=False),
+        "result": json.dumps(
+            result,
+            ensure_ascii=False,
+        ),
+        "producerVersion": WORKER_VERSION,
+        "producerPid": str(os.getpid()),
+        "producerHost": socket.gethostname(),
     }
 
-    logger.warning("PUBLISHING BUDGET RESULT payload=%s", payload)
-
-    await result_redis.xadd(
-        "result_stream",
+    logger.warning(
+        "PUBLISHING BUDGET RESULT job_id=%s payload=%s",
+        job_id,
         payload,
-        maxlen=10000,
+    )
+
+    result_stream_key = _result_stream_key()
+
+    result_message_id = await result_redis.xadd(
+        result_stream_key,
+        payload,
+        maxlen=10_000,
         approximate=True,
     )
 
-    logger.warning("PUBLISHED BUDGET RESULT TO result_stream job_id=%s", job_id)
+    decoded_result_message_id = _decode_message_id(
+        result_message_id
+    )
+
+    logger.warning(
+        "ACTUAL BUDGET XADD "
+        "stream=%s message_id=%s job_id=%s "
+        "producer_version=%s producer_pid=%s "
+        "producer_host=%s payload=%s",
+        result_stream_key,
+        decoded_result_message_id,
+        job_id,
+        WORKER_VERSION,
+        os.getpid(),
+        socket.gethostname(),
+        payload,
+    )
 
     result_key = f"job:{job_id}"
     ttl = int(settings.RESULT_TTL_SECONDS)
+
+    serialized_payload = json.dumps(
+        payload,
+        ensure_ascii=False,
+    )
 
     if ttl > 0:
         await result_redis.setex(
             result_key,
             ttl,
-            json.dumps(payload, ensure_ascii=False),
+            serialized_payload,
         )
     else:
         await result_redis.set(
             result_key,
-            json.dumps(payload, ensure_ascii=False),
+            serialized_payload,
         )
 
-    logger.warning("SAVED BUDGET RESULT KEY=%s", result_key)
+    logger.warning(
+        "SAVED BUDGET RESULT "
+        "key=%s stream_message_id=%s",
+        result_key,
+        decoded_result_message_id,
+    )
 
-    await input_redis.xack(stream_key, group, message_id)
+    # Chỉ ACK request sau khi:
+    # 1. Model dự đoán thành công
+    # 2. Kết quả đã publish vào result_stream
+    # 3. Kết quả đã lưu vào job:{jobId}
+    await input_redis.xack(
+        stream_key,
+        group,
+        message_id,
+    )
 
-    logger.warning("ACKED BUDGET MESSAGE id=%s job_id=%s", message_id, job_id)
+    logger.warning(
+        "ACKED BUDGET MESSAGE "
+        "request_message_id=%s "
+        "result_message_id=%s "
+        "job_id=%s",
+        message_id,
+        decoded_result_message_id,
+        job_id,
+    )
 
 
 def main() -> None:
