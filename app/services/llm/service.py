@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import logging
 import random
 from enum import Enum
 from functools import lru_cache
@@ -15,6 +16,8 @@ except Exception:  # pragma: no cover
     AsyncOpenAI = None  # type: ignore
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class LLMProvider(str, Enum):
@@ -100,6 +103,7 @@ class LLMService:
             raise ValueError("OPENAI_API_KEY is not set")
 
         target_model = model or settings.OPENAI_MODEL
+        logger.info("LLM call provider=openai endpoint=chat.completions model=%s", target_model)
         response = await self._openai_client.chat.completions.create(
             model=target_model,
             messages=[{"role": "user", "content": prompt}],
@@ -117,6 +121,7 @@ class LLMService:
             raise ValueError("GEMINI_API_KEY is not set")
 
         target_model = model or settings.GEMINI_MODEL
+        logger.info("LLM call provider=gemini endpoint=generate_content model=%s", target_model)
         client = self._gemini_client
 
         def _call() -> Any:
@@ -168,6 +173,7 @@ class LLMService:
 
         # ✅ đổi model
         target_model = model or "deepseek/deepseek-chat"
+        logger.info("LLM call provider=deepseek endpoint=chat.completions model=%s", target_model)
 
         max_retries = 5
         base_delay = 1
@@ -224,6 +230,7 @@ class LLMService:
             raise ValueError("image_bytes must not be empty")
 
         target_model = model or settings.OPENAI_VISION_MODEL
+        logger.info("LLM call provider=openai endpoint=chat.completions(vision) model=%s", target_model)
         b64 = base64.b64encode(image_bytes).decode("ascii")
         data_url = f"data:{mime_type};base64,{b64}"
 
@@ -260,6 +267,7 @@ class LLMService:
             raise ValueError("audio_bytes must not be empty")
 
         target_model = model or settings.OPENAI_TRANSCRIBE_MODEL
+        logger.info("LLM call provider=openai endpoint=audio.transcriptions model=%s", target_model)
         # OpenAI SDK accepts a (filename, fileobj) tuple for `file`.
         file_tuple = (filename, io.BytesIO(audio_bytes))
 

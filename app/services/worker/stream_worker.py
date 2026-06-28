@@ -18,13 +18,13 @@ from redis.exceptions import ResponseError
 from app.core.config import settings
 from app.services.fetcher.cloudinary_fetcher import get_cloudinary_fetcher
 from app.services.budget.budget_predictor import BudgetPredictor
+from app.services.budget.llm_budget_allocator import LLMBudgetAllocator
 
 logger = logging.getLogger(__name__)
 
 WORKER_VERSION = "budget-v2-transportation-9-categories"
 
 _DEFAULT_EXPENSE_VND = 50000
-_CATEGORY_LLM_FALLBACK_THRESHOLD = 0.5
 
 
 def _result_stream_key() -> str:
@@ -46,142 +46,6 @@ def _redis_url_info(url: str) -> dict[str, str]:
         "db": db,
         "ssl": str(parsed.scheme == "rediss").lower(),
     }
-
-
-def _parse_expense_number(raw: str | None) -> int:
-    if not raw:
-        return _DEFAULT_EXPENSE_VND
-
-    s = str(raw).strip()
-    # Grab first number-like token (supports 1.234.567 or 1,234,567)
-    m = re.search(r"\d[\d\s.,]*\d|\d+", s)
-    if not m:
-        return _DEFAULT_EXPENSE_VND
-
-    token = m.group(0)
-    digits = re.sub(r"\D", "", token)
-    if not digits:
-        return _DEFAULT_EXPENSE_VND
-
-    try:
-        n = int(digits)
-    except Exception:
-        return _DEFAULT_EXPENSE_VND
-
-    return n if n > 0 else _DEFAULT_EXPENSE_VND
-
-
-
-async def _extract_expense_vnd(llm_service, bill_text_vi: str) -> int:
-    if not bill_text_vi or not isinstance(bill_text_vi, str):
-        return _DEFAULT_EXPENSE_VND
-
-    prompt = (
-        "Bạn là hệ thống trích xuất chi phí từ nội dung hóa đơn bằng tiếng Việt.\n"
-        "Hãy trả về DUY NHẤT một số nguyên (VND) đại diện cho tổng tiền phải trả.\n"
-        "Không giải thích, không thêm chữ, không thêm ký hiệu tiền tệ.\n"
-        "Nếu không chắc chắn hoặc không tìm thấy tổng tiền, hãy trả về 50000.\n\n"
-        "Nội dung hóa đơn:\n"
-        "```\n"
-        f"{bill_text_vi}\n"
-        "```\n"
-        "\nChỉ trả về một số:"
-    )
-
-    try:
-        out = await llm_service.generate(prompt=prompt, provider="openai")
-    except Exception:
-        return _DEFAULT_EXPENSE_VND
-
-    return _parse_expense_number(out)
-
-
-async def _classify_category_with_llm(llm_service, text_vi: str) -> str | None:
-    if not text_vi or not isinstance(text_vi, str):
-        return None
-
-    # Import here to avoid pulling classifier deps at module import time.
-    from app.services.classifer.enums import CATEGORIES
-
-    categories = ", ".join(CATEGORIES)
-
-    prompt = (
-        "Bạn là hệ thống phân loại chi tiêu từ văn bản tiếng Việt.\n"
-        "Hãy trả về DUY NHẤT một nhãn danh mục từ danh sách cho phép.\n"
-        "Không giải thích, không thêm ký tự khác.\n"
-        "Nếu không chắc chắn, trả về OTHER.\n\n"
-        f"Danh mục cho phép: {categories}\n\n"
-        "Văn bản:\n"
-        "```\n"
-        f"{text_vi}\n"
-        "```\n\n"
-        "Chỉ trả về một nhãn danh mục:"
-    )
-
-    try:
-        out = await llm_service.generate(prompt=prompt, provider="openai")
-    except Exception:
-        return None
-
-    if not out:
-        return None
-
-    out_norm = str(out).strip().upper()
-    # Try exact match first
-    if out_norm in CATEGORIES:
-        return out_norm
-
-    # Fallback: find any allowed token inside the response
-    for c in CATEGORIES:
-        if re.search(rf"\b{re.escape(c)}\b", out_norm):
-            return c
-
-    return None
-
-
-async def _classify_transaction_type(llm_service, text_vi: str) -> str | None:
-    """Classify if transaction is EXPENSE or INCOME using LLM."""
-    if not text_vi or not isinstance(text_vi, str):
-        return None
-
-    prompt = (
-        "Bạn là hệ thống phân loại giao dịch tài chính từ văn bản tiếng Việt.\n"
-        "Hãy trả về DUY NHẤT một loại giao dịch: EXPENSE hoặc INCOME.\n"
-        "EXPENSE: chi tiêu, thanh toán, mua sắm, ...\n"
-        "INCOME: thu nhập, lương, thưởng, tiền nhận, ...\n"
-        "Không giải thích, không thêm ký tự khác.\n"
-        "Nếu không chắc chắn, trả về EXPENSE.\n\n"
-        "Văn bản:\n"
-        "```\n"
-        f"{text_vi}\n"
-        "```\n\n"
-        "Chỉ trả về EXPENSE hoặc INCOME:"
-    )
-
-    try:
-        out = await llm_service.generate(prompt=prompt, provider="openai")
-    except Exception:
-        return None
-
-    if not out:
-        return None
-
-    out_norm = str(out).strip().upper()
-
-    # Check for exact match
-    if out_norm == "EXPENSE":
-        return "EXPENSE"
-    if out_norm == "INCOME":
-        return "INCOME"
-    
-    # Fallback: try to find the keyword in response
-    if re.search(r"\bINCOME\b", out_norm):
-        return "INCOME"
-    if re.search(r"\bEXPENSE\b", out_norm):
-        return "EXPENSE"
-    
-    # Default to EXPENSE if unsure
-    return "EXPENSE"
 
 
 def _redis_from_url_checked(url: str, label: str) -> redis.Redis:
@@ -680,7 +544,6 @@ async def _process_one(
     input_redis: redis.Redis,
     result_redis: redis.Redis,
     fetcher,
-    classifier,
     image_extractor,
     voice_extractor,
     llm_service,
@@ -739,7 +602,8 @@ async def _process_one(
               "expense": abs(int(analysis.get("expense") or _DEFAULT_EXPENSE_VND)) or _DEFAULT_EXPENSE_VND,
               "type": str(analysis.get("type") or "EXPENSE"),
               "category": str(analysis.get("category") or "OTHER"),
-              "confidence": 1.0,
+              "description": str(analysis.get("description") or ""),
+              "confidence": analysis.get("confidence", 0.0),
           }
 
           await _publish_result(result_redis, job.job_id, payload)
@@ -774,14 +638,16 @@ async def _process_one(
               "expense": abs(int(analysis.get("expense") or _DEFAULT_EXPENSE_VND)) or _DEFAULT_EXPENSE_VND,
               "type": str(analysis.get("type") or "EXPENSE"),
               "category": str(analysis.get("category") or "OTHER"),
-              "confidence": 1.0,
+              "description": str(analysis.get("description") or ""),
+              "confidence": analysis.get("confidence", 0.0),
           }
 
           await _publish_result(result_redis, job.job_id, payload)
           await input_redis.xack(stream_key, group, message_id)
           return
 
-      # ── Notification: text already provided; keep regex + classifier cascade
+      # ── Notification: text already provided; unified classify+extract (like voice),
+      # with the deterministic regex/rule overriding the LLM for bank/e-wallet amounts.
       try:
           extracted_text = await _handle_notification_duty(fields)
       except Exception as e:
@@ -808,46 +674,32 @@ async def _process_one(
           )
           return
 
-      expense = _extract_amount_from_notification(extracted_text)
-      if expense is None:
-          expense = await _extract_expense_vnd(llm_service, extracted_text)
+      from app.services.llm.financial import classify_and_extract
 
-      transaction_type = _detect_transaction_type_rule(extracted_text)
-      if not transaction_type:
-          transaction_type = await _classify_transaction_type(llm_service, extracted_text)
-      if not transaction_type:
-          transaction_type = "EXPENSE"
+      analysis = await classify_and_extract(llm_service, extracted_text)
 
-      final_category = "OTHER"
-      confidence = 0.0
-      try:
-          classification = classifier.classify(extracted_text)
-          if classification.error or classification.category is None:
-              logger.warning("Classifier returned no category for job %s: %s", job.job_id, classification.error)
-              llm_category = await _classify_category_with_llm(llm_service, extracted_text)
-              if llm_category:
-                  final_category = llm_category
-          else:
-              final_category = classification.category.value
-              confidence = float(classification.confidence)
-              if confidence < _CATEGORY_LLM_FALLBACK_THRESHOLD:
-                  llm_category = await _classify_category_with_llm(llm_service, extracted_text)
-                  if llm_category:
-                      final_category = llm_category
-      except Exception as e:
-          logger.warning("Classifier raised for job %s: %s — falling back to LLM", job.job_id, e)
-          llm_category = await _classify_category_with_llm(llm_service, extracted_text)
-          if llm_category:
-              final_category = llm_category
+      # Bank/e-wallet alerts embed the exact signed amount and direction, so the
+      # deterministic regex/rule override the LLM result whenever they match.
+      regex_expense = _extract_amount_from_notification(extracted_text)
+      if regex_expense is not None:
+          expense = abs(regex_expense) or _DEFAULT_EXPENSE_VND
+      else:
+          expense = abs(int(analysis.get("expense") or _DEFAULT_EXPENSE_VND)) or _DEFAULT_EXPENSE_VND
+
+      transaction_type = (
+          _detect_transaction_type_rule(extracted_text)
+          or str(analysis.get("type") or "EXPENSE")
+      )
 
       payload = {
           "jobId": job.job_id,
           "userId": job.user_id,
           "text": extracted_text,
-          "expense": abs(expense) if expense else _DEFAULT_EXPENSE_VND,
-          "type": transaction_type or "EXPENSE",
-          "category": final_category,
-          "confidence": confidence,
+          "expense": expense,
+          "type": transaction_type,
+          "category": str(analysis.get("category") or "OTHER"),
+          "description": str(analysis.get("description") or ""),
+          "confidence": analysis.get("confidence", 0.0),
       }
 
       await _publish_result(result_redis, job.job_id, payload)
@@ -921,12 +773,15 @@ async def run_worker_forever() -> None:
 
     llm_service = get_llm_service()
 
-    from app.services.classifer.classifier import get_classifier_service
-    from app.services.extractor.image_extractor import ImageExtractor
+    logger.info(
+        "CONFIG MODELS openai_text=%s openai_vision=%s openai_transcribe=%s gemini=%s",
+        settings.OPENAI_MODEL,
+        settings.OPENAI_VISION_MODEL,
+        settings.OPENAI_TRANSCRIBE_MODEL,
+        settings.GEMINI_MODEL,
+    )
 
-    print("STEP 8: loading classifier...")
-    classifier = get_classifier_service()
-    print("STEP 9: classifier loaded")
+    from app.services.extractor.image_extractor import ImageExtractor
 
     print("STEP 10: loading image extractor...")
     image_extractor = ImageExtractor()
@@ -934,6 +789,7 @@ async def run_worker_forever() -> None:
 
     print("STEP 12: loading budget predictor...")
     budget_predictor = BudgetPredictor()
+    budget_allocator = LLMBudgetAllocator(llm_service, budget_predictor)
     print("STEP 13: budget predictor loaded")
 
     logger.info(
@@ -1010,7 +866,7 @@ async def run_worker_forever() -> None:
                 await _process_budget_allocation_one(
                     input_redis=input_redis,
                     result_redis=result_redis,
-                    predictor=budget_predictor,
+                    allocator=budget_allocator,
                     stream_key=stream_key,
                     group=group,
                     message_id=message_id,
@@ -1021,7 +877,6 @@ async def run_worker_forever() -> None:
                     input_redis,
                     result_redis,
                     fetcher,
-                    classifier,
                     image_extractor,
                     voice_extractor,
                     llm_service,
@@ -1127,7 +982,7 @@ def _parse_budget_payload(fields: dict[str, str]) -> tuple[str, str, dict]:
 async def _process_budget_allocation_one(
     input_redis: redis.Redis,
     result_redis: redis.Redis,
-    predictor,
+    allocator,
     stream_key: str,
     group: str,
     message_id: str,
@@ -1181,10 +1036,11 @@ async def _process_budget_allocation_one(
         history_features,
     )
 
-    prediction = predictor.predict(
+    prediction = await allocator.allocate(
         total_budget=total_budget,
         profile=profile,
         history_features=history_features,
+        currency=currency,
     )
 
     model_version = prediction.get(

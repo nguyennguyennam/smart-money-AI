@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_EXPENSE_VND = 50000
 DEFAULT_CATEGORY = "OTHER"
 DEFAULT_TYPE = "EXPENSE"
+DEFAULT_DESCRIPTION = ""
+# Confidence when the model omits it on an otherwise-successful result (neutral,
+# not the misleading 1.0 we used before). Error/empty paths use 0.0.
+DEFAULT_CONFIDENCE = 0.5
 
 
 _INSTRUCTION_BLOCK = (
@@ -31,13 +35,18 @@ _INSTRUCTION_BLOCK = (
     "- expense: số nguyên VND, là tổng tiền giao dịch. Nếu không chắc chắn, dùng 50000.\n"
     "- category: chọn DUY NHẤT một nhãn từ danh mục cho phép. Nếu không chắc, dùng OTHER.\n"
     "- type: EXPENSE cho chi tiêu/thanh toán, INCOME cho thu nhập/tiền nhận. Mặc định EXPENSE.\n"
+    "- description: mô tả ngắn gọn 2-5 từ về giao dịch, dùng CÙNG ngôn ngữ với văn bản "
+    "(tiếng Việt nếu văn bản tiếng Việt, tiếng Anh nếu văn bản tiếng Anh). "
+    "Không dấu câu thừa, không markdown.\n"
+    "- confidence: số thực 0..1 thể hiện mức độ chắc chắn của bạn về category/type/expense "
+    "(1 = rất chắc chắn, 0 = không chắc).\n"
 )
 
 
 _OCR_PROMPT = (
     "Bạn là hệ thống xử lý hóa đơn tiếng Việt từ ảnh.\n"
-    "Hãy thực hiện ĐỒNG THỜI ba việc và trả về DUY NHẤT một đối tượng JSON với các khóa: "
-    "text, category, type, expense.\n"
+    "Hãy thực hiện ĐỒNG THỜI các việc và trả về DUY NHẤT một đối tượng JSON với các khóa: "
+    "text, category, type, expense, description, confidence.\n"
     "- text: toàn bộ nội dung văn bản đọc được từ ảnh (giữ nguyên tiếng Việt, các dòng cách nhau bằng \\n).\n"
     f"{_INSTRUCTION_BLOCK}"
     "Chỉ trả về JSON, không thêm chú thích hay markdown."
@@ -47,7 +56,7 @@ _OCR_PROMPT = (
 def _classify_extract_prompt(text_vi: str) -> str:
     return (
         "Bạn là hệ thống phân tích giao dịch tài chính từ văn bản tiếng Việt.\n"
-        "Trả về DUY NHẤT một đối tượng JSON với các khóa: category, type, expense.\n"
+        "Trả về DUY NHẤT một đối tượng JSON với các khóa: category, type, expense, description, confidence.\n"
         f"{_INSTRUCTION_BLOCK}"
         "Chỉ trả về JSON, không thêm chú thích hay markdown.\n\n"
         "Văn bản:\n"
@@ -106,6 +115,31 @@ def _normalize_type(raw: Any) -> str:
     if "EXPENSE" in s:
         return "EXPENSE"
     return DEFAULT_TYPE
+
+
+def _normalize_description(raw: Any) -> str:
+    if raw is None:
+        return DEFAULT_DESCRIPTION
+    s = re.sub(r"\s+", " ", str(raw).strip().strip("\"'").strip())
+    if not s:
+        return DEFAULT_DESCRIPTION
+    # Guardrail in case the model ignores the 2-5 word request.
+    words = s.split(" ")
+    if len(words) > 6:
+        s = " ".join(words[:6])
+    return s
+
+
+def _normalize_confidence(raw: Any, default: float = DEFAULT_CONFIDENCE) -> float:
+    if raw is None:
+        return default
+    try:
+        val = float(str(raw).strip().rstrip("%"))
+    except (TypeError, ValueError):
+        return default
+    if val > 1.0:  # tolerate a 0..100 (percentage) scale
+        val = val / 100.0
+    return max(0.0, min(1.0, round(val, 4)))
 
 
 def _strip_json_fence(raw: str) -> str:
@@ -167,6 +201,8 @@ async def ocr_classify_extract(
             "category": DEFAULT_CATEGORY,
             "type": DEFAULT_TYPE,
             "expense": DEFAULT_EXPENSE_VND,
+            "description": DEFAULT_DESCRIPTION,
+            "confidence": 0.0,
             "error": str(e),
         }
 
@@ -178,6 +214,8 @@ async def ocr_classify_extract(
         "category": _normalize_category(obj.get("category")),
         "type": _normalize_type(obj.get("type")),
         "expense": _parse_expense_number(obj.get("expense")),
+        "description": _normalize_description(obj.get("description")),
+        "confidence": _normalize_confidence(obj.get("confidence")) if text else 0.0,
         "error": None if text else "No readable text content found in the uploaded file",
     }
 
@@ -186,12 +224,14 @@ async def classify_and_extract(
     llm: LLMService,
     text_vi: str,
 ) -> dict[str, Any]:
-    """One gpt-5-nano text call returning category + type + expense for a transcript."""
+    """One gpt-5-nano text call returning category + type + expense + description + confidence for a transcript."""
     if not text_vi or not isinstance(text_vi, str) or not text_vi.strip():
         return {
             "category": DEFAULT_CATEGORY,
             "type": DEFAULT_TYPE,
             "expense": DEFAULT_EXPENSE_VND,
+            "description": DEFAULT_DESCRIPTION,
+            "confidence": 0.0,
         }
 
     prompt = _classify_extract_prompt(text_vi)
@@ -210,6 +250,8 @@ async def classify_and_extract(
             "category": DEFAULT_CATEGORY,
             "type": DEFAULT_TYPE,
             "expense": DEFAULT_EXPENSE_VND,
+            "description": DEFAULT_DESCRIPTION,
+            "confidence": 0.0,
         }
 
     obj = _parse_json_object(raw)
@@ -217,4 +259,6 @@ async def classify_and_extract(
         "category": _normalize_category(obj.get("category")),
         "type": _normalize_type(obj.get("type")),
         "expense": _parse_expense_number(obj.get("expense")),
+        "description": _normalize_description(obj.get("description")),
+        "confidence": _normalize_confidence(obj.get("confidence")),
     }
