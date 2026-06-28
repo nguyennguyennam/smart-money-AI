@@ -28,27 +28,31 @@ DEFAULT_DESCRIPTION = ""
 DEFAULT_CONFIDENCE = 0.5
 
 
-_INSTRUCTION_BLOCK = (
+# Describes the shape of each item inside the `transactions` array.
+_TRANSACTION_FIELDS_BLOCK = (
+    "Mỗi giao dịch là một object với các khóa: category, type, expense, description, confidence.\n"
     f"Danh mục cho phép (category): {', '.join(CATEGORIES)}.\n"
     f"Loại giao dịch cho phép (type): {', '.join(TRANSACTION_TYPES)}.\n"
-    "Quy tắc:\n"
-    "- expense: số nguyên VND, là tổng tiền giao dịch. Nếu không chắc chắn, dùng 50000.\n"
+    "Quy tắc cho TỪNG giao dịch:\n"
+    "- expense: số nguyên VND, số tiền của RIÊNG giao dịch đó. Nếu không chắc chắn, dùng 50000.\n"
     "- category: chọn DUY NHẤT một nhãn từ danh mục cho phép. Nếu không chắc, dùng OTHER.\n"
     "- type: EXPENSE cho chi tiêu/thanh toán, INCOME cho thu nhập/tiền nhận. Mặc định EXPENSE.\n"
     "- description: mô tả ngắn gọn 2-5 từ về giao dịch, dùng CÙNG ngôn ngữ với văn bản "
     "(tiếng Việt nếu văn bản tiếng Việt, tiếng Anh nếu văn bản tiếng Anh). "
     "Không dấu câu thừa, không markdown.\n"
-    "- confidence: số thực 0..1 thể hiện mức độ chắc chắn của bạn về category/type/expense "
+    "- confidence: số thực 0..1 thể hiện mức độ chắc chắn về category/type/expense "
     "(1 = rất chắc chắn, 0 = không chắc).\n"
+    "Nếu văn bản có NHIỀU khoản (ví dụ 'cà phê 50k, bánh mì 20k'), hãy TÁCH thành nhiều giao dịch, "
+    "mỗi khoản một object. Nếu chỉ có một khoản, trả về mảng gồm một phần tử.\n"
 )
 
 
 _OCR_PROMPT = (
     "Bạn là hệ thống xử lý hóa đơn tiếng Việt từ ảnh.\n"
-    "Hãy thực hiện ĐỒNG THỜI các việc và trả về DUY NHẤT một đối tượng JSON với các khóa: "
-    "text, category, type, expense, description, confidence.\n"
+    "Trả về DUY NHẤT một đối tượng JSON với các khóa: text, transactions.\n"
     "- text: toàn bộ nội dung văn bản đọc được từ ảnh (giữ nguyên tiếng Việt, các dòng cách nhau bằng \\n).\n"
-    f"{_INSTRUCTION_BLOCK}"
+    "- transactions: MẢNG (array) các giao dịch trích xuất được từ hóa đơn.\n"
+    f"{_TRANSACTION_FIELDS_BLOCK}"
     "Chỉ trả về JSON, không thêm chú thích hay markdown."
 )
 
@@ -56,8 +60,8 @@ _OCR_PROMPT = (
 def _classify_extract_prompt(text_vi: str) -> str:
     return (
         "Bạn là hệ thống phân tích giao dịch tài chính từ văn bản tiếng Việt.\n"
-        "Trả về DUY NHẤT một đối tượng JSON với các khóa: category, type, expense, description, confidence.\n"
-        f"{_INSTRUCTION_BLOCK}"
+        "Trả về DUY NHẤT một đối tượng JSON với khóa: transactions (một MẢNG/array các giao dịch).\n"
+        f"{_TRANSACTION_FIELDS_BLOCK}"
         "Chỉ trả về JSON, không thêm chú thích hay markdown.\n\n"
         "Văn bản:\n"
         "```\n"
@@ -142,6 +146,48 @@ def _normalize_confidence(raw: Any, default: float = DEFAULT_CONFIDENCE) -> floa
     return max(0.0, min(1.0, round(val, 4)))
 
 
+def _default_transaction(confidence: float = 0.0) -> dict[str, Any]:
+    return {
+        "category": DEFAULT_CATEGORY,
+        "type": DEFAULT_TYPE,
+        "expense": DEFAULT_EXPENSE_VND,
+        "description": DEFAULT_DESCRIPTION,
+        "confidence": confidence,
+    }
+
+
+def _normalize_transaction(item: Any) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return _default_transaction()
+    return {
+        "category": _normalize_category(item.get("category")),
+        "type": _normalize_type(item.get("type")),
+        "expense": _parse_expense_number(item.get("expense")),
+        "description": _normalize_description(item.get("description")),
+        "confidence": _normalize_confidence(item.get("confidence")),
+    }
+
+
+def _normalize_transactions(obj: dict[str, Any]) -> list[dict[str, Any]]:
+    """Pull a clean, non-empty list of transactions out of the model's JSON.
+
+    Tolerates the legacy single-object shape and always returns at least one
+    item (a low-confidence default) so downstream never gets an empty array.
+    """
+    raw = obj.get("transactions") if isinstance(obj, dict) else None
+
+    items: list[dict[str, Any]] = []
+    if isinstance(raw, list):
+        items = [_normalize_transaction(it) for it in raw if isinstance(it, dict)]
+    elif isinstance(obj, dict) and any(k in obj for k in ("category", "type", "expense")):
+        # Legacy single-object response shape.
+        items = [_normalize_transaction(obj)]
+
+    if not items:
+        items = [_default_transaction()]
+    return items
+
+
 def _strip_json_fence(raw: str) -> str:
     s = raw.strip()
     if s.startswith("```"):
@@ -179,7 +225,7 @@ async def ocr_classify_extract(
     image_bytes: bytes,
     mime_type: str,
 ) -> dict[str, Any]:
-    """One gpt-5-nano vision call returning text + category + type + expense."""
+    """One gpt-5-nano vision call returning text + a list of transactions."""
     try:
         raw = await llm.generate_with_image(
             prompt=_OCR_PROMPT,
@@ -196,26 +242,14 @@ async def ocr_classify_extract(
         )
     except Exception as e:
         logger.warning("ocr_classify_extract LLM call failed: %s", e)
-        return {
-            "text": "",
-            "category": DEFAULT_CATEGORY,
-            "type": DEFAULT_TYPE,
-            "expense": DEFAULT_EXPENSE_VND,
-            "description": DEFAULT_DESCRIPTION,
-            "confidence": 0.0,
-            "error": str(e),
-        }
+        return {"text": "", "transactions": [], "error": str(e)}
 
     obj = _parse_json_object(raw)
     text = str(obj.get("text") or "").strip()
 
     return {
         "text": text,
-        "category": _normalize_category(obj.get("category")),
-        "type": _normalize_type(obj.get("type")),
-        "expense": _parse_expense_number(obj.get("expense")),
-        "description": _normalize_description(obj.get("description")),
-        "confidence": _normalize_confidence(obj.get("confidence")) if text else 0.0,
+        "transactions": _normalize_transactions(obj) if text else [],
         "error": None if text else "No readable text content found in the uploaded file",
     }
 
@@ -224,15 +258,9 @@ async def classify_and_extract(
     llm: LLMService,
     text_vi: str,
 ) -> dict[str, Any]:
-    """One gpt-5-nano text call returning category + type + expense + description + confidence for a transcript."""
+    """One gpt-5-nano text call returning a list of transactions for a transcript."""
     if not text_vi or not isinstance(text_vi, str) or not text_vi.strip():
-        return {
-            "category": DEFAULT_CATEGORY,
-            "type": DEFAULT_TYPE,
-            "expense": DEFAULT_EXPENSE_VND,
-            "description": DEFAULT_DESCRIPTION,
-            "confidence": 0.0,
-        }
+        return {"transactions": [_default_transaction()]}
 
     prompt = _classify_extract_prompt(text_vi)
 
@@ -246,19 +274,7 @@ async def classify_and_extract(
         raw = await llm.generate(prompt=prompt, provider=LLMProvider.OPENAI)
     except Exception as e:
         logger.warning("classify_and_extract LLM call failed: %s", e)
-        return {
-            "category": DEFAULT_CATEGORY,
-            "type": DEFAULT_TYPE,
-            "expense": DEFAULT_EXPENSE_VND,
-            "description": DEFAULT_DESCRIPTION,
-            "confidence": 0.0,
-        }
+        return {"transactions": [_default_transaction()]}
 
     obj = _parse_json_object(raw)
-    return {
-        "category": _normalize_category(obj.get("category")),
-        "type": _normalize_type(obj.get("type")),
-        "expense": _parse_expense_number(obj.get("expense")),
-        "description": _normalize_description(obj.get("description")),
-        "confidence": _normalize_confidence(obj.get("confidence")),
-    }
+    return {"transactions": _normalize_transactions(obj)}

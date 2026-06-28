@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import socket
+import uuid
 from dataclasses import dataclass, fields
 from typing import Any
 from urllib.parse import urlparse
@@ -25,6 +26,11 @@ logger = logging.getLogger(__name__)
 WORKER_VERSION = "budget-v2-transportation-9-categories"
 
 _DEFAULT_EXPENSE_VND = 50000
+
+
+def _with_transaction_ids(transactions: list[dict]) -> list[dict]:
+    """Stamp each transaction with a fresh uuid4 id (id first in the dict)."""
+    return [{"id": str(uuid.uuid4()), **t} for t in transactions]
 
 
 def _result_stream_key() -> str:
@@ -599,11 +605,7 @@ async def _process_one(
               "jobId": job.job_id,
               "userId": job.user_id,
               "text": extracted_text,
-              "expense": abs(int(analysis.get("expense") or _DEFAULT_EXPENSE_VND)) or _DEFAULT_EXPENSE_VND,
-              "type": str(analysis.get("type") or "EXPENSE"),
-              "category": str(analysis.get("category") or "OTHER"),
-              "description": str(analysis.get("description") or ""),
-              "confidence": analysis.get("confidence", 0.0),
+              "transactions": _with_transaction_ids(analysis.get("transactions") or []),
           }
 
           await _publish_result(result_redis, job.job_id, payload)
@@ -635,11 +637,7 @@ async def _process_one(
               "jobId": job.job_id,
               "userId": job.user_id,
               "text": extracted_text,
-              "expense": abs(int(analysis.get("expense") or _DEFAULT_EXPENSE_VND)) or _DEFAULT_EXPENSE_VND,
-              "type": str(analysis.get("type") or "EXPENSE"),
-              "category": str(analysis.get("category") or "OTHER"),
-              "description": str(analysis.get("description") or ""),
-              "confidence": analysis.get("confidence", 0.0),
+              "transactions": _with_transaction_ids(analysis.get("transactions") or []),
           }
 
           await _publish_result(result_redis, job.job_id, payload)
@@ -677,29 +675,24 @@ async def _process_one(
       from app.services.llm.financial import classify_and_extract
 
       analysis = await classify_and_extract(llm_service, extracted_text)
+      transactions = analysis.get("transactions") or []
 
-      # Bank/e-wallet alerts embed the exact signed amount and direction, so the
-      # deterministic regex/rule override the LLM result whenever they match.
-      regex_expense = _extract_amount_from_notification(extracted_text)
-      if regex_expense is not None:
-          expense = abs(regex_expense) or _DEFAULT_EXPENSE_VND
-      else:
-          expense = abs(int(analysis.get("expense") or _DEFAULT_EXPENSE_VND)) or _DEFAULT_EXPENSE_VND
-
-      transaction_type = (
-          _detect_transaction_type_rule(extracted_text)
-          or str(analysis.get("type") or "EXPENSE")
-      )
+      # Bank/e-wallet alerts embed the exact signed amount and direction, but the
+      # regex/rule only find ONE amount — so apply them as an override only when the
+      # LLM also sees a single transaction (the normal case for an alert).
+      if len(transactions) == 1:
+          regex_expense = _extract_amount_from_notification(extracted_text)
+          if regex_expense is not None:
+              transactions[0]["expense"] = abs(regex_expense) or _DEFAULT_EXPENSE_VND
+          rule_type = _detect_transaction_type_rule(extracted_text)
+          if rule_type:
+              transactions[0]["type"] = rule_type
 
       payload = {
           "jobId": job.job_id,
           "userId": job.user_id,
           "text": extracted_text,
-          "expense": expense,
-          "type": transaction_type,
-          "category": str(analysis.get("category") or "OTHER"),
-          "description": str(analysis.get("description") or ""),
-          "confidence": analysis.get("confidence", 0.0),
+          "transactions": _with_transaction_ids(transactions),
       }
 
       await _publish_result(result_redis, job.job_id, payload)
@@ -707,7 +700,13 @@ async def _process_one(
 
 
 async def _publish_result(result_redis: redis.Redis, job_id: str, payload: dict) -> None:
-    await result_redis.xadd("result_stream", payload, maxlen=10000, approximate=True)
+    # Redis stream entries are flat hashes, so list/dict fields (e.g. transactions)
+    # must be JSON-encoded for the stream. The job:{id} key keeps the real objects.
+    stream_payload = {
+        k: (json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v)
+        for k, v in payload.items()
+    }
+    await result_redis.xadd("result_stream", stream_payload, maxlen=10000, approximate=True)
 
     result_key = f"job:{job_id}"
     ttl = int(settings.RESULT_TTL_SECONDS)
