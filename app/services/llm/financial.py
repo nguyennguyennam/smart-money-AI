@@ -47,12 +47,28 @@ _TRANSACTION_FIELDS_BLOCK = (
 )
 
 
+# Single-transaction field rules for OCR (one receipt → one transaction).
+_SINGLE_TRANSACTION_FIELDS_BLOCK = (
+    f"Danh mục cho phép (category): {', '.join(CATEGORIES)}.\n"
+    f"Loại giao dịch cho phép (type): {', '.join(TRANSACTION_TYPES)}.\n"
+    "Quy tắc:\n"
+    "- expense: số nguyên VND, TỔNG số tiền của hóa đơn. Nếu không chắc chắn, dùng 50000.\n"
+    "- category: chọn DUY NHẤT một nhãn từ danh mục cho phép. Nếu không chắc, dùng OTHER.\n"
+    "- type: EXPENSE cho chi tiêu/thanh toán, INCOME cho thu nhập/tiền nhận. Mặc định EXPENSE.\n"
+    "- description: mô tả ngắn gọn 2-5 từ về hóa đơn, dùng CÙNG ngôn ngữ với văn bản "
+    "(tiếng Việt nếu văn bản tiếng Việt, tiếng Anh nếu văn bản tiếng Anh). "
+    "Không dấu câu thừa, không markdown.\n"
+    "- confidence: số thực 0..1 thể hiện mức độ chắc chắn về category/type/expense "
+    "(1 = rất chắc chắn, 0 = không chắc).\n"
+)
+
+
 _OCR_PROMPT = (
     "Bạn là hệ thống xử lý hóa đơn tiếng Việt từ ảnh.\n"
-    "Trả về DUY NHẤT một đối tượng JSON với các khóa: text, transactions.\n"
+    "Trả về DUY NHẤT một đối tượng JSON với các khóa: text, category, type, expense, description, confidence.\n"
     "- text: toàn bộ nội dung văn bản đọc được từ ảnh (giữ nguyên tiếng Việt, các dòng cách nhau bằng \\n).\n"
-    "- transactions: MẢNG (array) các giao dịch trích xuất được từ hóa đơn.\n"
-    f"{_TRANSACTION_FIELDS_BLOCK}"
+    "Toàn bộ hóa đơn được coi là MỘT giao dịch duy nhất (gộp các khoản thành một tổng).\n"
+    f"{_SINGLE_TRANSACTION_FIELDS_BLOCK}"
     "Chỉ trả về JSON, không thêm chú thích hay markdown."
 )
 
@@ -225,7 +241,12 @@ async def ocr_classify_extract(
     image_bytes: bytes,
     mime_type: str,
 ) -> dict[str, Any]:
-    """One gpt-5-nano vision call returning text + a list of transactions."""
+    """One gpt-5-nano vision call returning text + a single transaction.
+
+    A receipt image is treated as one transaction (the whole-bill total), so
+    this returns flat fields (category/type/expense/description/confidence)
+    rather than a list.
+    """
     try:
         raw = await llm.generate_with_image(
             prompt=_OCR_PROMPT,
@@ -242,16 +263,19 @@ async def ocr_classify_extract(
         )
     except Exception as e:
         logger.warning("ocr_classify_extract LLM call failed: %s", e)
-        return {"text": "", "transactions": [], "error": str(e)}
+        return {"text": "", "error": str(e), **_default_transaction()}
 
     obj = _parse_json_object(raw)
     text = str(obj.get("text") or "").strip()
 
-    return {
-        "text": text,
-        "transactions": _normalize_transactions(obj) if text else [],
-        "error": None if text else "No readable text content found in the uploaded file",
-    }
+    if not text:
+        return {
+            "text": "",
+            "error": "No readable text content found in the uploaded file",
+            **_default_transaction(),
+        }
+
+    return {"text": text, "error": None, **_normalize_transaction(obj)}
 
 
 async def classify_and_extract(

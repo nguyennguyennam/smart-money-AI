@@ -36,8 +36,9 @@ class ImageExtractor(BaseExtractor):
 
     `extract_bytes` returns the legacy `{error, text}` shape so the FastAPI
     `/process` endpoint keeps working. The Redis worker uses
-    `analyze_bytes` instead, which returns text + a list of transactions
-    from a single gpt-5-nano vision call.
+    `analyze_bytes` instead, which returns text + a single transaction
+    (category/type/expense/description/confidence) from one gpt-5-nano
+    vision call.
     """
 
     def __init__(self):
@@ -53,20 +54,19 @@ class ImageExtractor(BaseExtractor):
 
     async def analyze_bytes(self, content: bytes) -> dict:
         if not content:
-            return {"error": "Empty file", "text": "", "transactions": []}
+            return {"error": "Empty file", "text": ""}
 
         try:
             img = Image.open(io.BytesIO(content))
             mime_type = _mime_from_pil_format(img.format)
         except Exception:
-            return {"error": "Invalid image", "text": "", "transactions": []}
+            return {"error": "Invalid image", "text": ""}
 
         guard = await asyncio.to_thread(self.pipeline.run, img)
         if not guard.get("ok"):
             return {
                 "error": guard.get("error") or "Image rejected by preprocessing",
                 "text": "",
-                "transactions": [],
             }
 
         llm = get_llm_service()

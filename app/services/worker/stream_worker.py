@@ -585,7 +585,7 @@ async def _process_one(
           )
           return
 
-      # ── OCR: one gpt-5-nano vision call returns text + category + type + expense
+      # ── OCR: one gpt-5-nano vision call returns text + a single transaction
       if duty_lower == "ocr":
           analysis = await image_extractor.analyze_bytes(download.content)
           extracted_text = str(analysis.get("text") or "")
@@ -605,7 +605,11 @@ async def _process_one(
               "jobId": job.job_id,
               "userId": job.user_id,
               "text": extracted_text,
-              "transactions": _with_transaction_ids(analysis.get("transactions") or []),
+              "category": analysis.get("category"),
+              "type": analysis.get("type"),
+              "expense": analysis.get("expense"),
+              "description": analysis.get("description"),
+              "confidence": analysis.get("confidence"),
           }
 
           await _publish_result(result_redis, job.job_id, payload)
