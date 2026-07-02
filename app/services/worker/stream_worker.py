@@ -1005,9 +1005,22 @@ async def _process_budget_allocation_one(
         data,
     )
 
-    total_budget = int(data["safe_spending"])
     currency = str(data.get("currency", "VND"))
-    profile = data.get("user_profile")
+    month = data.get("month")
+
+    financial_setup = data.get("financialSetup")
+    if not isinstance(financial_setup, dict) or not financial_setup:
+        raise ValueError(
+            f"Missing or invalid financialSetup for job {job_id}"
+        )
+
+    try:
+        total_budget = int(round(float(financial_setup["safe_spending"])))
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(
+            f"Missing or invalid financialSetup.safe_spending for job {job_id}: "
+            f"{financial_setup.get('safe_spending')!r}"
+        )
 
     if total_budget <= 0:
         raise ValueError(
@@ -1015,35 +1028,30 @@ async def _process_budget_allocation_one(
             f"{total_budget}"
         )
 
-    if not isinstance(profile, dict) or not profile:
-        raise ValueError(
-            f"Missing or invalid user_profile for job {job_id}"
-        )
-
-    history_features = data.get("history_features")
+    spending_history = data.get("spendingHistory")
 
     # Không có history hoặc history rỗng:
-    # BudgetPredictor sẽ dùng profile model.
-    if not isinstance(history_features, dict) or not history_features:
-        history_features = None
+    # allocator sẽ dùng thiết lập tài chính để phân bổ.
+    if not isinstance(spending_history, dict) or not spending_history:
+        spending_history = None
 
     logger.warning(
-        "CALLING BUDGET PREDICTOR "
+        "CALLING BUDGET ALLOCATOR "
         "job_id=%s total_budget=%s "
-        "profile=%s has_history=%s "
-        "history_features=%s",
+        "financial_setup=%s has_history=%s "
+        "spending_history=%s",
         job_id,
         total_budget,
-        profile,
-        history_features is not None,
-        history_features,
+        financial_setup,
+        spending_history is not None,
+        spending_history,
     )
 
     prediction = await allocator.allocate(
-        total_budget=total_budget,
-        profile=profile,
-        history_features=history_features,
+        financial_setup=financial_setup,
+        spending_history=spending_history,
         currency=currency,
+        month=month,
     )
 
     model_version = prediction.get(
