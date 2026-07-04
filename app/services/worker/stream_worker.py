@@ -650,19 +650,20 @@ async def _process_one(
 
       # ── Notification: text already provided; unified classify+extract (like voice),
       # with the deterministic regex/rule overriding the LLM for bank/e-wallet amounts.
-      try:
-          extracted_text = await _handle_notification_duty(fields)
-      except Exception as e:
-          await _publish_extraction_error(
-              input_redis,
-              result_redis,
-              stream_key,
-              group,
-              message_id,
-              job.job_id,
-              str(e),
-          )
-          return
+      if duty_lower == "notification":
+        try:
+            extracted_text = await _handle_notification_duty(fields)
+        except Exception as e:
+            await _publish_extraction_error(
+                input_redis,
+                result_redis,
+                stream_key,
+                group,
+                message_id,
+                job.job_id,
+                str(e),
+            )
+            return
 
       if not extracted_text.strip():
           await _publish_extraction_error(
