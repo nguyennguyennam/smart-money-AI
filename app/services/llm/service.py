@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
+import logging
+import random
 from enum import Enum
 from functools import lru_cache
 from typing import Any
@@ -13,10 +17,13 @@ except Exception:  # pragma: no cover
 
 from app.core.config import settings
 
+logger = logging.getLogger(__name__)
+
 
 class LLMProvider(str, Enum):
     OPENAI = "openai"
     GEMINI = "gemini"
+    DEEPSEEK = "deepseek"  # NVIDIA DeepSeek (via OpenAI-compatible API)
 
 
 class LLMService:
@@ -28,6 +35,7 @@ class LLMService:
     def __init__(self) -> None:
         self._openai_client = self._build_openai_client()
         self._gemini_client = self._build_gemini_client()
+        self._deepseek_client = self._build_deepseek_client()
 
     @staticmethod
     def _build_openai_client() -> Any | None:
@@ -50,6 +58,19 @@ class LLMService:
         # google-genai SDK
         return genai.Client(api_key=settings.GEMINI_API_KEY)
 
+    @staticmethod
+    def _build_deepseek_client():
+        if not settings.OPENROUTER_API_KEY:
+            return None
+
+        if AsyncOpenAI is None:
+            raise ImportError("OpenAI SDK not installed")
+
+        return AsyncOpenAI(
+            api_key=settings.OPENROUTER_API_KEY,
+            base_url="https://openrouter.ai/api/v1",
+        )
+
     async def generate(
         self,
         prompt: str,
@@ -68,13 +89,21 @@ class LLMService:
         if provider_name == LLMProvider.GEMINI.value:
             return await self._generate_gemini(prompt=prompt, model=model, **kwargs)
 
-        raise ValueError("Unsupported provider. Use 'openai' or 'gemini'.")
+        if provider_name == LLMProvider.DEEPSEEK.value:
+            return await self._generate_deepseek(
+                prompt=prompt,
+                model=model,
+                **kwargs,
+            )
+
+        raise ValueError("Unsupported provider. Use 'openai', 'gemini', or 'deepseek'.")
 
     async def _generate_openai(self, prompt: str, model: str | None = None, **kwargs: Any) -> str:
         if self._openai_client is None:
             raise ValueError("OPENAI_API_KEY is not set")
 
         target_model = model or settings.OPENAI_MODEL
+        logger.info("LLM call provider=openai endpoint=chat.completions model=%s", target_model)
         response = await self._openai_client.chat.completions.create(
             model=target_model,
             messages=[{"role": "user", "content": prompt}],
@@ -92,6 +121,7 @@ class LLMService:
             raise ValueError("GEMINI_API_KEY is not set")
 
         target_model = model or settings.GEMINI_MODEL
+        logger.info("LLM call provider=gemini endpoint=generate_content model=%s", target_model)
         client = self._gemini_client
 
         def _call() -> Any:
@@ -101,14 +131,157 @@ class LLMService:
                 # If kwargs don't match this SDK version, still try a minimal call.
                 return client.models.generate_content(model=target_model, contents=prompt)
 
-        result = await asyncio.to_thread(_call)
-        text = getattr(result, "text", None)
+        try:
+            result = await asyncio.to_thread(_call)
 
-        if isinstance(text, str) and text.strip():
+            text = getattr(result, "text", None)
+
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+
+            return str(result)
+
+        except Exception as e:
+
+            error_text = str(e)
+
+            if (
+                "RESOURCE_EXHAUSTED" in error_text
+                or "429" in error_text
+                or "UNAVAILABLE" in error_text
+                or "503" in error_text
+                or "PERMISSION_DENIED" in error_text
+                or "NOT_FOUND" in error_text
+            ):
+                return await self._generate_deepseek(
+                    prompt=prompt,
+                    model=model,
+                    **kwargs,
+                )
+
+            raise
+
+    async def _generate_deepseek(
+        self,
+        prompt: str,
+        model: str | None = None,
+        **kwargs,
+    ) -> str:
+
+        if self._deepseek_client is None:
+            raise ValueError("DEEPSEEK_API_KEY is not set")
+
+        # ✅ đổi model
+        target_model = model or "deepseek/deepseek-chat"
+        logger.info("LLM call provider=deepseek endpoint=chat.completions model=%s", target_model)
+
+        max_retries = 5
+        base_delay = 1
+
+        for attempt in range(max_retries):
+            try:
+                response = await self._deepseek_client.chat.completions.create(
+                    model=target_model,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful financial assistant."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=kwargs.get("temperature", 0.7),
+                    top_p=kwargs.get("top_p", 0.95),
+                    max_tokens=kwargs.get("max_tokens", 16384),
+                    extra_body={
+                        "chat_template_kwargs": {
+                            "thinking": False  # giống config NVIDIA
+                        }
+                    }
+                )
+
+                return response.choices[0].message.content.strip()
+
+            except Exception as e:
+                error_text = str(e)
+                print("[DeepSeek ERROR]:", error_text)
+
+                if "429" in error_text or "Too Many Requests" in error_text:
+                    wait_time = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                    print(f"[DeepSeek] Rate limit → retry in {wait_time:.2f}s")
+                    await asyncio.sleep(wait_time)
+                    continue
+
+                # ❌ các lỗi này retry là vô nghĩa
+                if any(x in error_text for x in ["401", "403", "404", "Unauthorized", "Not Found"]):
+                    raise Exception(f"DeepSeek config error: {error_text}")
+
+                raise
+
+        raise Exception("DeepSeek failed after retries")
+
+    async def generate_with_image(
+        self,
+        prompt: str,
+        image_bytes: bytes,
+        mime_type: str,
+        model: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        if self._openai_client is None:
+            raise ValueError("OPENAI_API_KEY is not set")
+        if not image_bytes:
+            raise ValueError("image_bytes must not be empty")
+
+        target_model = model or settings.OPENAI_VISION_MODEL
+        logger.info("LLM call provider=openai endpoint=chat.completions(vision) model=%s", target_model)
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        data_url = f"data:{mime_type};base64,{b64}"
+
+        response = await self._openai_client.chat.completions.create(
+            model=target_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }
+            ],
+            **kwargs,
+        )
+
+        if not response.choices:
+            return ""
+
+        message = response.choices[0].message
+        return (message.content or "").strip()
+
+    async def transcribe(
+        self,
+        audio_bytes: bytes,
+        filename: str,
+        model: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        if self._openai_client is None:
+            raise ValueError("OPENAI_API_KEY is not set")
+        if not audio_bytes:
+            raise ValueError("audio_bytes must not be empty")
+
+        target_model = model or settings.OPENAI_TRANSCRIBE_MODEL
+        logger.info("LLM call provider=openai endpoint=audio.transcriptions model=%s", target_model)
+        # OpenAI SDK accepts a (filename, fileobj) tuple for `file`.
+        file_tuple = (filename, io.BytesIO(audio_bytes))
+
+        response = await self._openai_client.audio.transcriptions.create(
+            model=target_model,
+            file=file_tuple,
+            **kwargs,
+        )
+
+        text = getattr(response, "text", None)
+        if isinstance(text, str):
             return text.strip()
+        return str(response).strip()
 
-        return str(result)
-    
 
 @lru_cache(maxsize=1)
 def get_llm_service() -> LLMService:

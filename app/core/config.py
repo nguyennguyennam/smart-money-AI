@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     # Redis (result storage) — can be a separate instance/host.
     # Default points to a separate logical DB for convenience.
     REDIS_RESULT_URL: str = "redis://localhost:6379/1"
+    REDIS_RESULT_STREAM_KEY: str = "result_stream"
     RESULT_TTL_SECONDS: int = 180  #  3 mins
 
     # Download limits
@@ -45,10 +46,18 @@ class Settings(BaseSettings):
     # LLM providers
     OPENAI_API_KEY: str | None = None
     OPENAI_BASE_URL: str | None = None
-    OPENAI_MODEL: str = "gpt-4o-mini"
+    OPENAI_MODEL: str = "gpt-5-nano"
+    OPENAI_VISION_MODEL: str = "gpt-5-nano"
+    OPENAI_TRANSCRIBE_MODEL: str = "gpt-4o-mini-transcribe"
 
     GEMINI_API_KEY: str | None = None
     GEMINI_MODEL: str = "gemini-2.0-flash"
+
+    NVIDIA_API_KEY: str | None = None
+    NVIDIA_MODEL: str = "nvidia-deepseek-v4-pro"
+
+    DEEPSEEK_API_KEY: str | None = None
+    OPENROUTER_API_KEY: str | None = None
 
     class Config:
         env_file = ".env"

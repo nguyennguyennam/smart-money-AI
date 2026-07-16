@@ -7,31 +7,67 @@ from typing import TYPE_CHECKING
 from PIL import Image
 
 from .base import BaseExtractor
-from ...models.ocr_model import OCRModel
 from ...pipeline.ocr_pipeline import OCRPipeline
-from PIL import Image
-import asyncio
-import io
+from ...services.llm import get_llm_service
+from ...services.llm.financial import ocr_classify_extract
+
+if TYPE_CHECKING:  # pragma: no cover
+    from fastapi import UploadFile
+
+
+_PIL_FORMAT_TO_MIME = {
+    "JPEG": "image/jpeg",
+    "PNG": "image/png",
+    "WEBP": "image/webp",
+    "GIF": "image/gif",
+    "BMP": "image/bmp",
+    "TIFF": "image/tiff",
+}
+
+
+def _mime_from_pil_format(fmt: str | None) -> str:
+    if not fmt:
+        return "image/jpeg"
+    return _PIL_FORMAT_TO_MIME.get(fmt.upper(), "image/jpeg")
 
 
 class ImageExtractor(BaseExtractor):
+    """Validates an image then hands it to the OCR LLM call.
+
+    `extract_bytes` returns the legacy `{error, text}` shape so the FastAPI
+    `/process` endpoint keeps working. The Redis worker uses
+    `analyze_bytes` instead, which returns text + a single transaction
+    (category/type/expense/description/confidence) from one gpt-5-nano
+    vision call.
+    """
 
     def __init__(self):
-        self.model = OCRModel()
-        self.pipeline = OCRPipeline(self.model)
+        self.pipeline = OCRPipeline()
 
     async def extract(self, file: "UploadFile"):
         content = await file.read()
         return await self.extract_bytes(content)
 
     async def extract_bytes(self, content: bytes):
+        result = await self.analyze_bytes(content)
+        return {"error": result.get("error"), "text": result.get("text", "")}
+
+    async def analyze_bytes(self, content: bytes) -> dict:
         if not content:
             return {"error": "Empty file", "text": ""}
 
         try:
             img = Image.open(io.BytesIO(content))
+            mime_type = _mime_from_pil_format(img.format)
         except Exception:
             return {"error": "Invalid image", "text": ""}
 
-        result = await asyncio.to_thread(self.pipeline.run, img)
-        return result
+        guard = await asyncio.to_thread(self.pipeline.run, img)
+        if not guard.get("ok"):
+            return {
+                "error": guard.get("error") or "Image rejected by preprocessing",
+                "text": "",
+            }
+
+        llm = get_llm_service()
+        return await ocr_classify_extract(llm, content, mime_type)

@@ -6,9 +6,12 @@ import logging
 import os
 import re
 import socket
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, fields
 from typing import Any
+from urllib.parse import urlparse
 
+from app.services.extractor import context
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
@@ -16,147 +19,39 @@ from redis.exceptions import ResponseError
 from app.core.config import settings
 from app.services.fetcher.cloudinary_fetcher import get_cloudinary_fetcher
 from app.services.budget.budget_predictor import BudgetPredictor
+from app.services.budget.llm_budget_allocator import LLMBudgetAllocator
 
 logger = logging.getLogger(__name__)
 
+WORKER_VERSION = "budget-v2-transportation-9-categories"
 
 _DEFAULT_EXPENSE_VND = 50000
-_CATEGORY_LLM_FALLBACK_THRESHOLD = 0.5
 
 
-def _parse_expense_number(raw: str | None) -> int:
-    if not raw:
-        return _DEFAULT_EXPENSE_VND
-
-    s = str(raw).strip()
-    # Grab first number-like token (supports 1.234.567 or 1,234,567)
-    m = re.search(r"\d[\d\s.,]*\d|\d+", s)
-    if not m:
-        return _DEFAULT_EXPENSE_VND
-
-    token = m.group(0)
-    digits = re.sub(r"\D", "", token)
-    if not digits:
-        return _DEFAULT_EXPENSE_VND
-
-    try:
-        n = int(digits)
-    except Exception:
-        return _DEFAULT_EXPENSE_VND
-
-    return n if n > 0 else _DEFAULT_EXPENSE_VND
+def _with_transaction_ids(transactions: list[dict]) -> list[dict]:
+    """Stamp each transaction with a fresh uuid4 id (id first in the dict)."""
+    return [{"id": str(uuid.uuid4()), **t} for t in transactions]
 
 
-async def _extract_expense_vnd(llm_service, bill_text_vi: str) -> int:
-    if not bill_text_vi or not isinstance(bill_text_vi, str):
-        return _DEFAULT_EXPENSE_VND
-
-    prompt = (
-        "Bạn là hệ thống trích xuất chi phí từ nội dung hóa đơn bằng tiếng Việt.\n"
-        "Hãy trả về DUY NHẤT một số nguyên (VND) đại diện cho tổng tiền phải trả.\n"
-        "Không giải thích, không thêm chữ, không thêm ký hiệu tiền tệ.\n"
-        "Nếu không chắc chắn hoặc không tìm thấy tổng tiền, hãy trả về 50000.\n\n"
-        "Nội dung hóa đơn:\n"
-        "```\n"
-        f"{bill_text_vi}\n"
-        "```\n"
-        "\nChỉ trả về một số:"
-    )
-
-    try:
-        out = await llm_service.generate(prompt=prompt, provider="gemini")
-    except Exception:
-        return _DEFAULT_EXPENSE_VND
-
-    return _parse_expense_number(out)
+def _result_stream_key() -> str:
+    return getattr(settings, "REDIS_RESULT_STREAM_KEY", "result_stream")
 
 
-async def _classify_category_with_llm(llm_service, text_vi: str) -> str | None:
-    if not text_vi or not isinstance(text_vi, str):
-        return None
-
-    # Import here to avoid pulling classifier deps at module import time.
-    from app.services.classifer.enums import CATEGORIES
-
-    categories = ", ".join(CATEGORIES)
-
-    prompt = (
-        "Bạn là hệ thống phân loại chi tiêu từ văn bản tiếng Việt.\n"
-        "Hãy trả về DUY NHẤT một nhãn danh mục từ danh sách cho phép.\n"
-        "Không giải thích, không thêm ký tự khác.\n"
-        "Nếu không chắc chắn, trả về OTHER.\n\n"
-        f"Danh mục cho phép: {categories}\n\n"
-        "Văn bản:\n"
-        "```\n"
-        f"{text_vi}\n"
-        "```\n\n"
-        "Chỉ trả về một nhãn danh mục:" 
-    )
-
-    try:
-        out = await llm_service.generate(prompt=prompt, provider="gemini")
-    except Exception:
-        return None
-
-    if not out:
-        return None
-
-    out_norm = str(out).strip().upper()
-    # Try exact match first
-    if out_norm in CATEGORIES:
-        return out_norm
-
-    # Fallback: find any allowed token inside the response
-    for c in CATEGORIES:
-        if re.search(rf"\b{re.escape(c)}\b", out_norm):
-            return c
-
-    return None
+def _decode_message_id(message_id: Any) -> str:
+    if isinstance(message_id, bytes):
+        return message_id.decode("utf-8", errors="replace")
+    return str(message_id)
 
 
-async def _classify_transaction_type(llm_service, text_vi: str) -> str | None:
-    """Classify if transaction is EXPENSE or INCOME using LLM."""
-    if not text_vi or not isinstance(text_vi, str):
-        return None
-
-    prompt = (
-        "Bạn là hệ thống phân loại giao dịch tài chính từ văn bản tiếng Việt.\n"
-        "Hãy trả về DUY NHẤT một loại giao dịch: EXPENSE hoặc INCOME.\n"
-        "EXPENSE: chi tiêu, thanh toán, mua sắm, ...\n"
-        "INCOME: thu nhập, lương, thưởng, tiền nhận, ...\n"
-        "Không giải thích, không thêm ký tự khác.\n"
-        "Nếu không chắc chắn, trả về EXPENSE.\n\n"
-        "Văn bản:\n"
-        "```\n"
-        f"{text_vi}\n"
-        "```\n\n"
-        "Chỉ trả về EXPENSE hoặc INCOME:"
-    )
-
-    try:
-        out = await llm_service.generate(prompt=prompt, provider="gemini")
-    except Exception:
-        return None
-
-    if not out:
-        return None
-
-    out_norm = str(out).strip().upper()
-    
-    # Check for exact match
-    if out_norm == "EXPENSE":
-        return "EXPENSE"
-    if out_norm == "INCOME":
-        return "INCOME"
-    
-    # Fallback: try to find the keyword in response
-    if re.search(r"\bINCOME\b", out_norm):
-        return "INCOME"
-    if re.search(r"\bEXPENSE\b", out_norm):
-        return "EXPENSE"
-    
-    # Default to EXPENSE if unsure
-    return "EXPENSE"
+def _redis_url_info(url: str) -> dict[str, str]:
+    parsed = urlparse(url)
+    db = (parsed.path or "/0").lstrip("/") or "0"
+    return {
+        "host": parsed.hostname or "",
+        "port": str(parsed.port or 6379),
+        "db": db,
+        "ssl": str(parsed.scheme == "rediss").lower(),
+    }
 
 
 def _redis_from_url_checked(url: str, label: str) -> redis.Redis:
@@ -269,9 +164,12 @@ def _parse_job(fields: dict[str, str]) -> JobEvent | None:
 
     # ✅ validate URL (skip for notification duty)
     duty_lower = duty.lower() if duty else ""
-    if duty_lower != "notification":
+    if duty_lower not in (
+        "notification",
+        "financial_assistant",
+    ):
         if not file_url or not file_url.startswith("http"):
-            raise ValueError(f"Invalid file_url: {file_url}")
+            raise ValueError("Invalid file_url")
 
     print(f"Parsed jobId={job_id} file_url={file_url} duty={duty}")
 
@@ -451,8 +349,20 @@ async def _publish_extraction_error(
         "category": "OTHER",
         "confidence": 0.0,
     }
-    result_stream_key = getattr(settings, "REDIS_RESULT_STREAM_KEY", "result_stream")
-    await result_redis.xadd(result_stream_key, payload, maxlen=10000, approximate=True)
+    result_stream_key = _result_stream_key()
+    result_message_id = await result_redis.xadd(
+        result_stream_key,
+        payload,
+        maxlen=10000,
+        approximate=True,
+    )
+    logger.warning(
+        "ACTUAL XADD stream=%s message_id=%s job_id=%s payload=%s",
+        result_stream_key,
+        _decode_message_id(result_message_id),
+        job_id,
+        payload,
+    )
     result_key = f"job:{job_id}"
     ttl = int(settings.RESULT_TTL_SECONDS)
     if ttl > 0:
@@ -460,30 +370,14 @@ async def _publish_extraction_error(
     else:
         await result_redis.set(result_key, json.dumps(payload, ensure_ascii=False))
     await input_redis.xack(stream_key, group, message_id)
-async def _handle_ocr_duty(image_extractor, download) -> str:
-    """Extract text from image using OCR."""
-    ocr_result = await image_extractor.extract_bytes(download.content)
-    if ocr_result.get("error"):
-        raise RuntimeError(str(ocr_result.get("error")))
-    return str(ocr_result.get("text") or "")
-
-
-async def _handle_voice_duty(voice_extractor, download) -> str:
-    """Extract text from audio using ASR."""
-    asr_result = await voice_extractor.extract_bytes(
-        download.content, content_type=download.content_type
-    )
-    if asr_result.get("error"):
-        raise RuntimeError(str(asr_result.get("error")))
-    return str(asr_result.get("text") or "")
 
 
 async def _handle_notification_duty(fields: dict[str, str]) -> str:
     """Extract text from notification (text is already provided)."""
     # Check multiple possible field names
     text = (
-        fields.get("text") 
-        or fields.get("message") 
+        fields.get("text")
+        or fields.get("message")
         or fields.get("data")
         or ""
     )
@@ -492,6 +386,87 @@ async def _handle_notification_duty(fields: dict[str, str]) -> str:
             f"Missing text/message/data in notification duty. Available fields: {list(fields.keys())}"
         )
     return str(text)
+
+async def _handle_financial_assistant_duty(
+    llm_service,
+    fields: dict[str, str],
+) -> str:
+
+    raw = fields.get("data")
+
+    if not raw:
+        raise ValueError("Missing assistant context")
+
+    context = json.loads(raw)
+
+    context_json = json.dumps(context, ensure_ascii=False)
+
+
+    prompt = f"""
+    Bạn là Financial Coach của SmartMoney.
+
+    Dữ liệu:
+    {context_json}
+
+    NHIỆM VỤ:
+
+    1. spendingSummary
+    - So sánh currentWeek.totalExpense với previousWeek.totalExpense.
+
+    - Nếu currentWeek.totalExpense = 0:
+    => nói ngắn gọn rằng chưa có giao dịch tuần này.
+
+    - Nếu currentWeek.totalExpense > previousWeek.totalExpense:
+    => tính % tăng và nêu ngắn gọn.
+
+    - Nếu currentWeek.totalExpense <= previousWeek.totalExpense:
+    => "Bạn đang chi tiêu hợp lý so với tuần trước."
+
+    - state:
+    + Tăng chi tiêu => "Negative"
+    + Không tăng => "Positive"
+
+    ------------------------------------
+
+    2. savingSummary
+    - Tính tổng savingGap.
+
+    - Nếu totalSavingGap > 0:
+    => "Bạn đang thiếu X VNĐ..."
+
+    - Nếu = 0:
+    => "Bạn đang đi đúng kế hoạch tiết kiệm."
+
+    - state:
+    + Thiếu tiền => "Negative"
+    + Đúng kế hoạch => "Positive"
+
+    ------------------------------------
+
+    YÊU CẦU:
+    - Mỗi summary tối đa 80 ký tự.
+    - Không markdown.
+    - Không giải thích thêm.
+    - Chỉ trả về JSON.
+
+    JSON:
+
+    {{
+    "spending": {{
+        "text": "...",
+        "state": "Positive | Negative"
+    }},
+    "saving": {{
+        "text": "...",
+        "state": "Positive | Negative"
+    }}
+    }}
+    """
+
+    return await llm_service.generate(
+        prompt=prompt,
+        provider="gemini",
+    )
 
 def _extract_amount_from_notification(text: str) -> int | None:
     if not text:
@@ -525,33 +500,56 @@ def _extract_amount_from_notification(text: str) -> int | None:
 
     return None
 
-async def _extract_text_by_duty(
-    job: JobEvent,
-    download,
-    image_extractor,
-    voice_extractor,
-    fields: dict[str, str],
-) -> str:
-    """Route to appropriate handler based on duty type."""
-    duty_lower = job.duty.lower()
-    
-    duty_handlers = {
-        "ocr": lambda: _handle_ocr_duty(image_extractor, download),
-        "voice": lambda: _handle_voice_duty(voice_extractor, download),
-        "notification": lambda: _handle_notification_duty(fields),
+async def _process_financial_assistant(
+    input_redis,
+    result_redis,
+    llm_service,
+    stream_key,
+    group,
+    message_id,
+    fields,
+):
+    job_id = fields["jobId"]
+    user_id = fields["userId"]
+
+    result = await _handle_financial_assistant_duty(
+        llm_service,
+        fields,
+    )
+
+    payload = {
+        "jobId": job_id,
+        "userId": user_id,
+        "duty": "FINANCIAL_ASSISTANT",
+        "status": "COMPLETED",
+        "type": "FINANCIAL_ASSISTANT_RESULT",
+        "result": result,
     }
-    
-    if duty_lower not in duty_handlers:
-        raise ValueError(f"Unsupported duty: {job.duty}")
-    
-    return await duty_handlers[duty_lower]()
+
+    await result_redis.xadd(
+        "result_stream",
+        payload,
+        maxlen=10000,
+        approximate=True,
+    )
+
+    await result_redis.setex(
+        f"job:{job_id}",
+        settings.RESULT_TTL_SECONDS,
+        json.dumps(payload, ensure_ascii=False),
+    )
+
+    await input_redis.xack(
+        stream_key,
+        group,
+        message_id,
+    )
 
 
 async def _process_one(
     input_redis: redis.Redis,
     result_redis: redis.Redis,
     fetcher,
-    classifier,
     image_extractor,
     voice_extractor,
     llm_service,
@@ -567,31 +565,105 @@ async def _process_one(
           logger.info("Skipped init message id=%s", message_id)
           return
 
+      duty_lower = job.duty.lower()
       download = None
 
-      if job.duty.lower() in ("ocr", "voice"):
+      if duty_lower in ("ocr", "voice"):
           enhanced_url = enhance_cloudinary_url(job.file_url)
           download = await fetcher.fetch(enhanced_url)
 
-      try:
-          extracted_text = await _extract_text_by_duty(
-              job,
-              download,
-              image_extractor,
-              voice_extractor,
-              fields,
-          )
-      except Exception as e:
-          await _publish_extraction_error(
-              input_redis,
-              result_redis,
-              stream_key,
-              group,
-              message_id,
-              job.job_id,
-              str(e),
+      # ── Financial assistant: LLM coaching summary, handled in its own helper
+      if duty_lower == "financial_assistant":
+          await _process_financial_assistant(
+              input_redis=input_redis,
+              result_redis=result_redis,
+              llm_service=llm_service,
+              stream_key=stream_key,
+              group=group,
+              message_id=message_id,
+              fields=fields,
           )
           return
+
+      # ── OCR: one gpt-5-nano vision call returns text + a single transaction
+      if duty_lower == "ocr":
+          analysis = await image_extractor.analyze_bytes(download.content)
+          extracted_text = str(analysis.get("text") or "")
+          if analysis.get("error") or not extracted_text.strip():
+              await _publish_extraction_error(
+                  input_redis,
+                  result_redis,
+                  stream_key,
+                  group,
+                  message_id,
+                  job.job_id,
+                  str(analysis.get("error") or "No readable text content found in the uploaded file"),
+              )
+              return
+
+          payload = {
+              "jobId": job.job_id,
+              "userId": job.user_id,
+              "text": extracted_text,
+              "category": analysis.get("category"),
+              "type": analysis.get("type"),
+              "expense": analysis.get("expense"),
+              "description": analysis.get("description"),
+              "confidence": analysis.get("confidence"),
+          }
+
+          await _publish_result(result_redis, job.job_id, payload)
+          await input_redis.xack(stream_key, group, message_id)
+          return
+
+      # ── Voice: gpt-4o-mini-transcribe → gpt-5-nano classify+extract
+      if duty_lower == "voice":
+          asr_result = await voice_extractor.extract_bytes(
+              download.content, content_type=download.content_type
+          )
+          extracted_text = str(asr_result.get("text") or "")
+          if asr_result.get("error") or not extracted_text.strip():
+              await _publish_extraction_error(
+                  input_redis,
+                  result_redis,
+                  stream_key,
+                  group,
+                  message_id,
+                  job.job_id,
+                  str(asr_result.get("error") or "No readable text content found in the uploaded file"),
+              )
+              return
+
+          from app.services.llm.financial import classify_and_extract
+
+          analysis = await classify_and_extract(llm_service, extracted_text)
+          payload = {
+              "jobId": job.job_id,
+              "userId": job.user_id,
+              "text": extracted_text,
+              "transactions": _with_transaction_ids(analysis.get("transactions") or []),
+          }
+
+          await _publish_result(result_redis, job.job_id, payload)
+          await input_redis.xack(stream_key, group, message_id)
+          return
+
+      # ── Notification: text already provided; unified classify+extract (like voice),
+      # with the deterministic regex/rule overriding the LLM for bank/e-wallet amounts.
+      if duty_lower == "notification":
+        try:
+            extracted_text = await _handle_notification_duty(fields)
+        except Exception as e:
+            await _publish_extraction_error(
+                input_redis,
+                result_redis,
+                stream_key,
+                group,
+                message_id,
+                job.job_id,
+                str(e),
+            )
+            return
 
       if not extracted_text.strip():
           await _publish_extraction_error(
@@ -605,76 +677,48 @@ async def _process_one(
           )
           return
 
-      if job.duty.lower() == "notification":
-          expense = _extract_amount_from_notification(extracted_text)
+      from app.services.llm.financial import classify_and_extract
 
-          if expense is None:
-              expense = await _extract_expense_vnd(
-                  llm_service,
-                  extracted_text,
-              )
-      else:
-          expense = await _extract_expense_vnd(
-              llm_service,
-              extracted_text,
-          )
+      analysis = await classify_and_extract(llm_service, extracted_text)
+      transactions = analysis.get("transactions") or []
 
-      transaction_type = _detect_transaction_type_rule(extracted_text)
+      # Bank/e-wallet alerts embed the exact signed amount and direction, but the
+      # regex/rule only find ONE amount — so apply them as an override only when the
+      # LLM also sees a single transaction (the normal case for an alert).
+      if len(transactions) == 1:
+          regex_expense = _extract_amount_from_notification(extracted_text)
+          if regex_expense is not None:
+              transactions[0]["expense"] = abs(regex_expense) or _DEFAULT_EXPENSE_VND
+          rule_type = _detect_transaction_type_rule(extracted_text)
+          if rule_type:
+              transactions[0]["type"] = rule_type
 
-      if not transaction_type:
-          transaction_type = await _classify_transaction_type(llm_service, extracted_text)
-
-      if not transaction_type:
-          transaction_type = "EXPENSE"
-
-      final_category = "OTHER"
-      confidence = 0.0
-      try:
-          classification = classifier.classify(extracted_text)
-          if classification.error or classification.category is None:
-              logger.warning("Classifier returned no category for job %s: %s", job.job_id, classification.error)
-              llm_category = await _classify_category_with_llm(llm_service, extracted_text)
-              if llm_category:
-                  final_category = llm_category
-          else:
-              final_category = classification.category.value
-              confidence = float(classification.confidence)
-              if confidence < _CATEGORY_LLM_FALLBACK_THRESHOLD:
-                  llm_category = await _classify_category_with_llm(llm_service, extracted_text)
-                  if llm_category:
-                      final_category = llm_category
-      except Exception as e:
-          logger.warning("Classifier raised for job %s: %s — falling back to LLM", job.job_id, e)
-          llm_category = await _classify_category_with_llm(llm_service, extracted_text)
-          if llm_category:
-              final_category = llm_category
-
-      result_key = f"job:{job.job_id}"
       payload = {
           "jobId": job.job_id,
           "userId": job.user_id,
           "text": extracted_text,
-          "expense": abs(expense) if expense else _DEFAULT_EXPENSE_VND, 
-          "type": transaction_type or "EXPENSE",
-          "category": final_category,
-          "confidence": confidence,
+          "transactions": _with_transaction_ids(transactions),
       }
 
-
-      await result_redis.xadd("result_stream", payload, maxlen=10000, approximate=True)
-
-      ttl = int(settings.RESULT_TTL_SECONDS)
-      if ttl > 0:
-          await result_redis.setex(
-              result_key,
-              ttl,
-              json.dumps(payload, ensure_ascii=False),
-          )
-      else:
-          await result_redis.set(result_key, json.dumps(payload, ensure_ascii=False))
-
+      await _publish_result(result_redis, job.job_id, payload)
       await input_redis.xack(stream_key, group, message_id)
 
+
+async def _publish_result(result_redis: redis.Redis, job_id: str, payload: dict) -> None:
+    # Redis stream entries are flat hashes, so list/dict fields (e.g. transactions)
+    # must be JSON-encoded for the stream. The job:{id} key keeps the real objects.
+    stream_payload = {
+        k: (json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v)
+        for k, v in payload.items()
+    }
+    await result_redis.xadd("result_stream", stream_payload, maxlen=10000, approximate=True)
+
+    result_key = f"job:{job_id}"
+    ttl = int(settings.RESULT_TTL_SECONDS)
+    if ttl > 0:
+        await result_redis.setex(result_key, ttl, json.dumps(payload, ensure_ascii=False))
+    else:
+        await result_redis.set(result_key, json.dumps(payload, ensure_ascii=False))
 
 
 async def run_worker_forever() -> None:
@@ -695,12 +739,29 @@ async def run_worker_forever() -> None:
     logger.info("CONFIG REDIS_STREAM_KEY=%s", stream_key)
     logger.info("CONFIG REDIS_CONSUMER_GROUP=%s", group)
     logger.info("CONFIG REDIS_CONSUMER_NAME=%s", consumer_name)
+    logger.info("CONFIG REDIS_RESULT_STREAM_KEY=%s", _result_stream_key())
 
     async def connect() -> tuple[redis.Redis, redis.Redis]:
         in_r = _redis_from_url_checked(settings.REDIS_STREAM_URL, "REDIS_STREAM_URL")
         out_r = _redis_from_url_checked(settings.REDIS_RESULT_URL, "REDIS_RESULT_URL")
         await in_r.ping()
         await out_r.ping()
+        in_info = _redis_url_info(settings.REDIS_STREAM_URL)
+        out_info = _redis_url_info(settings.REDIS_RESULT_URL)
+        logger.warning(
+            "AI INPUT REDIS host=%s port=%s db=%s ssl=%s",
+            in_info["host"],
+            in_info["port"],
+            in_info["db"],
+            in_info["ssl"],
+        )
+        logger.warning(
+            "AI RESULT REDIS host=%s port=%s db=%s ssl=%s",
+            out_info["host"],
+            out_info["port"],
+            out_info["db"],
+            out_info["ssl"],
+        )
         await _ensure_consumer_group(in_r, stream_key, group)
         return in_r, out_r
 
@@ -716,12 +777,15 @@ async def run_worker_forever() -> None:
 
     llm_service = get_llm_service()
 
-    from app.services.classifer.classifier import get_classifier_service
-    from app.services.extractor.image_extractor import ImageExtractor
+    logger.info(
+        "CONFIG MODELS openai_text=%s openai_vision=%s openai_transcribe=%s gemini=%s",
+        settings.OPENAI_MODEL,
+        settings.OPENAI_VISION_MODEL,
+        settings.OPENAI_TRANSCRIBE_MODEL,
+        settings.GEMINI_MODEL,
+    )
 
-    print("STEP 8: loading classifier...")
-    classifier = get_classifier_service()
-    print("STEP 9: classifier loaded")
+    from app.services.extractor.image_extractor import ImageExtractor
 
     print("STEP 10: loading image extractor...")
     image_extractor = ImageExtractor()
@@ -729,6 +793,7 @@ async def run_worker_forever() -> None:
 
     print("STEP 12: loading budget predictor...")
     budget_predictor = BudgetPredictor()
+    budget_allocator = LLMBudgetAllocator(llm_service, budget_predictor)
     print("STEP 13: budget predictor loaded")
 
     logger.info(
@@ -782,109 +847,108 @@ async def run_worker_forever() -> None:
 
         message_id, fields = item
 
-try:
-    logger.warning("RAW STREAM MESSAGE id=%s fields=%s", message_id, fields)
-    logger.warning(
-        "CURRENT PROCESS consumer=%s pid=%s stream=%s group=%s",
-        consumer_name,
-        os.getpid(),
-        stream_key,
-        group,
-    )
+        try:
+            logger.warning("RAW STREAM MESSAGE id=%s fields=%s", message_id, fields)
+            logger.warning(
+                "CURRENT PROCESS consumer=%s pid=%s stream=%s group=%s",
+                consumer_name,
+                os.getpid(),
+                stream_key,
+                group,
+            )
 
-    # Skip init messages (from feat/budget-allocation)
-    if fields.get("init") in ("true", '"true"'):
-        logger.warning("Skip invalid stream message id=%s fields=%s", message_id, fields)
-        await input_redis.xack(stream_key, group, message_id)
-        continue
+            # Skip init messages (from feat/budget-allocation)
+            if fields.get("init") in ("true", '"true"'):
+                logger.warning("Skip invalid stream message id=%s fields=%s", message_id, fields)
+                await input_redis.xack(stream_key, group, message_id)
+                continue
 
-    duty = (fields.get("duty") or "").strip().upper()
+            duty = (fields.get("duty") or "").strip().upper()
 
-    # Dispatch based on duty type (budget allocation added in feat/budget-allocation)
-    if duty == "BUDGET_ALLOCATION_PLAN":
-        await _process_budget_allocation_one(
-            input_redis=input_redis,
-            result_redis=result_redis,
-            predictor=budget_predictor,
-            stream_key=stream_key,
-            group=group,
-            message_id=message_id,
-            fields=fields,
-        )
-    else:
-        await _process_one(
-            input_redis,
-            result_redis,
-            fetcher,
-            classifier,
-            image_extractor,
-            voice_extractor,
-            llm_service,
-            stream_key,
-            group,
-            message_id,
-            fields,
-        )
+            # Dispatch based on duty type (budget allocation added in feat/budget-allocation)
+            if duty == "BUDGET_ALLOCATION_PLAN":
+                await _process_budget_allocation_one(
+                    input_redis=input_redis,
+                    result_redis=result_redis,
+                    allocator=budget_allocator,
+                    stream_key=stream_key,
+                    group=group,
+                    message_id=message_id,
+                    fields=fields,
+                )
+            else:
+                await _process_one(
+                    input_redis,
+                    result_redis,
+                    fetcher,
+                    image_extractor,
+                    voice_extractor,
+                    llm_service,
+                    stream_key,
+                    group,
+                    message_id,
+                    fields,
+                )
 
-    logger.info(
-        "Processed job stream id=%s jobId=%s duty=%s",
-        message_id,
-        fields.get("jobId"),
-        duty,
-    )
+            logger.info(
+                "Processed job stream id=%s jobId=%s duty=%s",
+                message_id,
+                fields.get("jobId"),
+                duty,
+            )
 
-# Handle malformed messages (ValueError added in feat/redis_consumer)
-except ValueError as e:
-    err = str(e)
-    logger.exception(
-        "Malformed message stream id=%s error=%s",
-        message_id,
-        err,
-    )
-    await _dead_letter(
-        input_redis,
-        settings.REDIS_DEAD_LETTER_STREAM_KEY,
-        stream_key,
-        message_id,
-        fields,
-        err,
-    )
-    await input_redis.xack(stream_key, group, message_id)
-    continue
+        # Handle malformed messages (ValueError added in feat/redis_consumer)
+        except ValueError as e:
+            err = str(e)
+            logger.exception(
+                "Malformed message stream id=%s error=%s",
+                message_id,
+                err,
+            )
+            await _dead_letter(
+                input_redis,
+                settings.REDIS_DEAD_LETTER_STREAM_KEY,
+                stream_key,
+                message_id,
+                fields,
+                err,
+            )
+            await input_redis.xack(stream_key, group, message_id)
+            continue
 
-# Handle other processing errors (existing from both branches)
-except Exception as e:
-    err = str(e)
-    job_id = fields.get("jobId")
-    times_delivered = await _times_delivered(
-        input_redis,
-        stream_key,
-        group,
-        message_id,
-    )
-    logger.exception(
-        "Failed processing stream id=%s jobId=%s delivered=%s error=%s",
-        message_id,
-        job_id,
-        times_delivered,
-        err,
-    )
-    max_retries = int(settings.REDIS_MAX_RETRIES)
-    if (
-        times_delivered is not None
-        and max_retries > 0
-        and times_delivered >= max_retries
-    ):
-        await _dead_letter(
-            input_redis,
-            settings.REDIS_DEAD_LETTER_STREAM_KEY,
-            stream_key,
-            message_id,
-            fields,
-            err,
-        )
-        await input_redis.xack(stream_key, group, message_id)
-     await asyncio.sleep(0.5)
+        # Handle other processing errors (existing from both branches)
+        except Exception as e:
+            err = str(e)
+            job_id = fields.get("jobId")
+            times_delivered = await _times_delivered(
+                input_redis,
+                stream_key,
+                group,
+                message_id,
+            )
+            logger.exception(
+                "Failed processing stream id=%s jobId=%s delivered=%s error=%s",
+                message_id,
+                job_id,
+                times_delivered,
+                err,
+            )
+            max_retries = int(settings.REDIS_MAX_RETRIES)
+            if (
+                times_delivered is not None
+                and max_retries > 0
+                and times_delivered >= max_retries
+            ):
+                await _dead_letter(
+                    input_redis,
+                    settings.REDIS_DEAD_LETTER_STREAM_KEY,
+                    stream_key,
+                    message_id,
+                    fields,
+                    err,
+                )
+                await input_redis.xack(stream_key, group, message_id)
+            await asyncio.sleep(0.5)
 
 
 # Budget
@@ -922,34 +986,97 @@ def _parse_budget_payload(fields: dict[str, str]) -> tuple[str, str, dict]:
 async def _process_budget_allocation_one(
     input_redis: redis.Redis,
     result_redis: redis.Redis,
-    predictor,
+    allocator,
     stream_key: str,
     group: str,
     message_id: str,
     fields: dict[str, str],
 ) -> None:
-    logger.warning("ENTER _process_budget_allocation_one fields=%s", fields)
+    logger.warning(
+        "ENTER _process_budget_allocation_one fields=%s",
+        fields,
+    )
 
     job_id, user_id, data = _parse_budget_payload(fields)
 
-    logger.warning("PARSED BUDGET job_id=%s user_id=%s data=%s", job_id, user_id, data)
-
-    total_budget = int(data["safe_spending"])
-    currency = data.get("currency", "VND")
-    profile = data["user_profile"]
-
-    logger.warning("CALLING BUDGET PREDICTOR total_budget=%s profile=%s", total_budget, profile)
-
-    prediction = predictor.predict(
-        total_budget=total_budget,
-        profile=profile,
+    logger.warning(
+        "PARSED BUDGET job_id=%s user_id=%s data=%s",
+        job_id,
+        user_id,
+        data,
     )
 
-    logger.warning("BUDGET PREDICTION RESULT=%s", prediction)
+    currency = str(data.get("currency", "VND"))
+    month = data.get("month")
+
+    financial_setup = data.get("financialSetup")
+    if not isinstance(financial_setup, dict) or not financial_setup:
+        raise ValueError(
+            f"Missing or invalid financialSetup for job {job_id}"
+        )
+
+    try:
+        total_budget = int(round(float(financial_setup["safe_spending"])))
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(
+            f"Missing or invalid financialSetup.safe_spending for job {job_id}: "
+            f"{financial_setup.get('safe_spending')!r}"
+        )
+
+    if total_budget <= 0:
+        raise ValueError(
+            f"Invalid safe_spending for job {job_id}: "
+            f"{total_budget}"
+        )
+
+    spending_history = data.get("spendingHistory")
+
+    # Không có history hoặc history rỗng:
+    # allocator sẽ dùng thiết lập tài chính để phân bổ.
+    if not isinstance(spending_history, dict) or not spending_history:
+        spending_history = None
+
+    logger.warning(
+        "CALLING BUDGET ALLOCATOR "
+        "job_id=%s total_budget=%s "
+        "financial_setup=%s has_history=%s "
+        "spending_history=%s",
+        job_id,
+        total_budget,
+        financial_setup,
+        spending_history is not None,
+        spending_history,
+    )
+
+    prediction = await allocator.allocate(
+        financial_setup=financial_setup,
+        spending_history=spending_history,
+        currency=currency,
+        month=month,
+    )
+
+    model_version = prediction.get(
+        "modelVersion",
+        "UNKNOWN",
+    )
+
+    logger.warning(
+        "BUDGET PREDICTION RESULT "
+        "job_id=%s model_version=%s result=%s",
+        job_id,
+        model_version,
+        prediction,
+    )
 
     result = {
-        "totalBudget": total_budget,
+        "totalBudget": int(
+            prediction.get(
+                "totalBudget",
+                total_budget,
+            )
+        ),
         "currency": currency,
+        "modelVersion": model_version,
         "categories": prediction["categories"],
     }
 
@@ -959,40 +1086,94 @@ async def _process_budget_allocation_one(
         "duty": "BUDGET_ALLOCATION_PLAN",
         "status": "COMPLETED",
         "type": "BUDGET_ALLOCATION_RESULT",
-        "result": json.dumps(result, ensure_ascii=False),
+        "result": json.dumps(
+            result,
+            ensure_ascii=False,
+        ),
+        "producerVersion": WORKER_VERSION,
+        "producerPid": str(os.getpid()),
+        "producerHost": socket.gethostname(),
     }
 
-    logger.warning("PUBLISHING BUDGET RESULT payload=%s", payload)
-
-    await result_redis.xadd(
-        "result_stream",
+    logger.warning(
+        "PUBLISHING BUDGET RESULT job_id=%s payload=%s",
+        job_id,
         payload,
-        maxlen=10000,
+    )
+
+    result_stream_key = _result_stream_key()
+
+    result_message_id = await result_redis.xadd(
+        result_stream_key,
+        payload,
+        maxlen=10_000,
         approximate=True,
     )
 
-    logger.warning("PUBLISHED BUDGET RESULT TO result_stream job_id=%s", job_id)
+    decoded_result_message_id = _decode_message_id(
+        result_message_id
+    )
+
+    logger.warning(
+        "ACTUAL BUDGET XADD "
+        "stream=%s message_id=%s job_id=%s "
+        "producer_version=%s producer_pid=%s "
+        "producer_host=%s payload=%s",
+        result_stream_key,
+        decoded_result_message_id,
+        job_id,
+        WORKER_VERSION,
+        os.getpid(),
+        socket.gethostname(),
+        payload,
+    )
 
     result_key = f"job:{job_id}"
     ttl = int(settings.RESULT_TTL_SECONDS)
+
+    serialized_payload = json.dumps(
+        payload,
+        ensure_ascii=False,
+    )
 
     if ttl > 0:
         await result_redis.setex(
             result_key,
             ttl,
-            json.dumps(payload, ensure_ascii=False),
+            serialized_payload,
         )
     else:
         await result_redis.set(
             result_key,
-            json.dumps(payload, ensure_ascii=False),
+            serialized_payload,
         )
 
-    logger.warning("SAVED BUDGET RESULT KEY=%s", result_key)
+    logger.warning(
+        "SAVED BUDGET RESULT "
+        "key=%s stream_message_id=%s",
+        result_key,
+        decoded_result_message_id,
+    )
 
-    await input_redis.xack(stream_key, group, message_id)
+    # Chỉ ACK request sau khi:
+    # 1. Model dự đoán thành công
+    # 2. Kết quả đã publish vào result_stream
+    # 3. Kết quả đã lưu vào job:{jobId}
+    await input_redis.xack(
+        stream_key,
+        group,
+        message_id,
+    )
 
-    logger.warning("ACKED BUDGET MESSAGE id=%s job_id=%s", message_id, job_id)
+    logger.warning(
+        "ACKED BUDGET MESSAGE "
+        "request_message_id=%s "
+        "result_message_id=%s "
+        "job_id=%s",
+        message_id,
+        decoded_result_message_id,
+        job_id,
+    )
 
 
 def main() -> None:

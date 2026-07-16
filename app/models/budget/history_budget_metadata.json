@@ -1,5 +1,5 @@
 {
-  "model_version": "PROFILE_BASED_CATBOOST_V2_9_CATEGORIES",
+  "model_version": "TRANSACTION_HISTORY_CATBOOST_V2_9_CATEGORIES",
   "category_cols": [
     "FOOD",
     "TRANSPORTATION",
@@ -12,19 +12,21 @@
     "OTHER"
   ],
   "target_cols": [
-    "FOOD_ratio",
-    "TRANSPORTATION_ratio",
-    "CLOTHING_ratio",
-    "UTILITIES_ratio",
-    "ENTERTAINMENT_ratio",
-    "HEALTH_ratio",
-    "EDUCATION_ratio",
-    "SHOPPING_ratio",
-    "OTHER_ratio"
+    "target_FOOD_ratio",
+    "target_TRANSPORTATION_ratio",
+    "target_CLOTHING_ratio",
+    "target_UTILITIES_ratio",
+    "target_ENTERTAINMENT_ratio",
+    "target_HEALTH_ratio",
+    "target_EDUCATION_ratio",
+    "target_SHOPPING_ratio",
+    "target_OTHER_ratio"
   ],
   "feature_cols": [
-    "role",
     "total_budget",
+    "has_transaction_history",
+    "months_history_count",
+    "role",
     "living_status",
     "income_level",
     "transport_mode",
@@ -32,7 +34,37 @@
     "work_style",
     "family_status",
     "study_intensity",
-    "health_need"
+    "health_need",
+    "last_1m_FOOD_ratio",
+    "avg_3m_FOOD_ratio",
+    "std_3m_FOOD_ratio",
+    "last_1m_TRANSPORTATION_ratio",
+    "avg_3m_TRANSPORTATION_ratio",
+    "std_3m_TRANSPORTATION_ratio",
+    "last_1m_CLOTHING_ratio",
+    "avg_3m_CLOTHING_ratio",
+    "std_3m_CLOTHING_ratio",
+    "last_1m_UTILITIES_ratio",
+    "avg_3m_UTILITIES_ratio",
+    "std_3m_UTILITIES_ratio",
+    "last_1m_ENTERTAINMENT_ratio",
+    "avg_3m_ENTERTAINMENT_ratio",
+    "std_3m_ENTERTAINMENT_ratio",
+    "last_1m_HEALTH_ratio",
+    "avg_3m_HEALTH_ratio",
+    "std_3m_HEALTH_ratio",
+    "last_1m_EDUCATION_ratio",
+    "avg_3m_EDUCATION_ratio",
+    "std_3m_EDUCATION_ratio",
+    "last_1m_SHOPPING_ratio",
+    "avg_3m_SHOPPING_ratio",
+    "std_3m_SHOPPING_ratio",
+    "last_1m_OTHER_ratio",
+    "avg_3m_OTHER_ratio",
+    "std_3m_OTHER_ratio",
+    "last_1m_total_spend",
+    "total_spend_avg_3m",
+    "total_spend_std_3m"
   ],
   "categorical_cols": [
     "role",
@@ -45,6 +77,7 @@
     "study_intensity",
     "health_need"
   ],
+  "history_window": 3,
   "allowed_values": {
     "role": [
       "business_owner",
