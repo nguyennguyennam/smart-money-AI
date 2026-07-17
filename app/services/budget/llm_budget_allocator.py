@@ -187,6 +187,7 @@ class LLMBudgetAllocator:
         currency: str = "VND",
         month: str | None = None,
     ) -> dict[str, Any]:
+        
         if not isinstance(financial_setup, dict) or not financial_setup:
             raise ValueError("financial_setup must be a non-empty dictionary")
 
