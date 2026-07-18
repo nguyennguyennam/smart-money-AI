@@ -1,0 +1,33 @@
+name: Deploy AI Server
+
+on:
+  push:
+    branches:
+      - refactor/full_llm_apis
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy AI Server
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+
+          script: |
+            cd /opt/smart-money-AI
+
+            echo "Pull newest code..."
+            git pull origin refactor/full_llm_apis
+
+            echo "Install dependencies..."
+            source venv/bin/activate
+            pip install -r requirements.txt
+
+            echo "Restart AI Worker..."
+            systemctl restart smartmoney-ai
+
+            echo "Done!"
