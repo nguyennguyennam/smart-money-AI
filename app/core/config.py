@@ -56,7 +56,6 @@ class Settings(BaseSettings):
     NVIDIA_API_KEY: str | None = None
     NVIDIA_MODEL: str = "nvidia-deepseek-v4-pro"
 
-    DEEPSEEK_API_KEY: str | None = None
     OPENROUTER_API_KEY: str | None = None
 
     class Config:

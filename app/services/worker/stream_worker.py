@@ -465,7 +465,7 @@ async def _handle_financial_assistant_duty(
 
     return await llm_service.generate(
         prompt=prompt,
-        provider="gemini",
+        provider="openai",
     )
 
 def _extract_amount_from_notification(text: str) -> int | None:
