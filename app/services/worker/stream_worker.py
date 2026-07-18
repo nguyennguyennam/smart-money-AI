@@ -703,7 +703,7 @@ async def _process_one(
       await _publish_result(result_redis, job.job_id, payload)
       await input_redis.xack(stream_key, group, message_id)
 
-
+#publish result to result_stream and job:{id} key
 async def _publish_result(result_redis: redis.Redis, job_id: str, payload: dict) -> None:
     # Redis stream entries are flat hashes, so list/dict fields (e.g. transactions)
     # must be JSON-encoded for the stream. The job:{id} key keeps the real objects.
