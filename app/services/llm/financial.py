@@ -33,6 +33,7 @@ _TRANSACTION_FIELDS_BLOCK = (
     "Mỗi giao dịch là một object với các khóa: category, type, expense, description, confidence.\n"
     f"Danh mục cho phép (category): {', '.join(CATEGORIES)}.\n"
     f"Loại giao dịch cho phép (type): {', '.join(TRANSACTION_TYPES)}.\n"
+    
     "Quy tắc cho TỪNG giao dịch:\n"
     "- expense: số nguyên VND, số tiền của RIÊNG giao dịch đó. Nếu không chắc chắn, dùng 50000.\n"
     "- category: chọn DUY NHẤT một nhãn từ danh mục cho phép. Nếu không chắc, dùng OTHER.\n"
@@ -302,3 +303,65 @@ async def classify_and_extract(
 
     obj = _parse_json_object(raw)
     return {"transactions": _normalize_transactions(obj)}
+
+async def classify_notification(
+    llm: LLMService,
+    text: str,
+) -> dict[str, Any]:
+    """
+    Classify bank notification (SMS / push).
+    ALWAYS return exactly ONE transaction.
+    """
+
+    if not text or not isinstance(text, str) or not text.strip():
+        return {"transactions": [_default_transaction()]}
+
+    prompt = (
+        "Bạn là hệ thống phân tích thông báo ngân hàng (SMS/push notification).\n"
+        "Đây LUÔN là MỘT giao dịch duy nhất.\n\n"
+
+        "Trả về DUY NHẤT một JSON object với khóa: transaction.\n\n"
+
+        "Quy tắc QUAN TRỌNG:\n"
+        "- Chỉ tạo 1 giao dịch duy nhất\n"
+        "- KHÔNG được tự tạo thêm giao dịch\n"
+        "- expense: lấy từ số tiền thay đổi số dư (ví dụ '-30,000 VND' → 30000)\n"
+        "- Nếu có dấu '-' → EXPENSE\n"
+        "- Nếu là tiền vào (cộng tiền) → INCOME\n"
+        "- description: lấy từ nội dung chính (ví dụ 'nap tien dien thoai')\n"
+        "- category: chọn từ danh mục, nếu không chắc → OTHER\n"
+        "- confidence: 0..1\n\n"
+
+        f"Danh mục: {', '.join(CATEGORIES)}\n"
+        f"Loại: {', '.join(TRANSACTION_TYPES)}\n\n"
+
+        "Chỉ trả về JSON, không markdown.\n\n"
+
+        "Văn bản:\n"
+        "```\n"
+        f"{text}\n"
+        "```"
+    )
+
+    try:
+        raw = await llm.generate(
+            prompt=prompt,
+            provider=LLMProvider.OPENAI,
+            response_format={"type": "json_object"},
+        )
+    except TypeError:
+        raw = await llm.generate(prompt=prompt, provider=LLMProvider.OPENAI)
+    except Exception as e:
+        logger.warning("classify_notification LLM failed: %s", e)
+        return {"transactions": [_default_transaction()]}
+
+    obj = _parse_json_object(raw)
+
+    # hỗ trợ cả 2 format: {transaction:{}} hoặc flat
+    tx = obj.get("transaction") if isinstance(obj, dict) else None
+    if not tx and isinstance(obj, dict):
+        tx = obj
+
+    normalized = _normalize_transaction(tx)
+
+    return {"transactions": [normalized]}

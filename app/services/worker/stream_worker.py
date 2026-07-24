@@ -12,6 +12,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 from app.services.extractor import context
+from app.services.llm.financial import ocr_classify_extract
+from app.services.llm.financial import ocr_classify_extract
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
@@ -677,9 +679,9 @@ async def _process_one(
           )
           return
 
-      from app.services.llm.financial import classify_and_extract
+      from app.services.llm.financial import classify_notification
 
-      analysis = await classify_and_extract(llm_service, extracted_text)
+      analysis = await classify_notification(llm_service, extracted_text)
       transactions = analysis.get("transactions") or []
 
       # Bank/e-wallet alerts embed the exact signed amount and direction, but the
