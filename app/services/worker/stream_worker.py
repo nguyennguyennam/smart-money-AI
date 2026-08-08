@@ -729,11 +729,10 @@ async def run_worker_forever() -> None:
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
 
-    consumer_name = settings.REDIS_CONSUMER_NAME
-    if consumer_name == "smartmoney-ai-1":
-        consumer_name = f"{socket.gethostname()}-{os.getpid()}"
-
-    #consumer_name = f"{settings.REDIS_CONSUMER_NAME}-{socket.gethostname()}-{os.getpid()}"
+    # Consumer name must be unique per process: with a shared name, two workers
+    # in the same group merge their pending lists and XAUTOCLAIM can steal a
+    # message another process is still working on (duplicate LLM calls/results).
+    consumer_name = f"{settings.REDIS_CONSUMER_NAME}-{socket.gethostname()}-{os.getpid()}"
 
     stream_key = settings.REDIS_STREAM_KEY
     group = settings.REDIS_CONSUMER_GROUP
