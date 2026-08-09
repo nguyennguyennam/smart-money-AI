@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import socket
+import unicodedata
 import uuid
 from dataclasses import dataclass, fields
 from typing import Any
@@ -112,25 +113,68 @@ def _decode_stream_fields(fields: dict[Any, Any]) -> dict[str, str]:
         out[k] = v
     return out
 
-def _detect_transaction_type_rule(text: str) -> str | None:
+def _strip_accents(text: str) -> str:
+    # Bank SMS are usually unaccented while app pushes are accented; normalize
+    # both to unaccented lowercase so one keyword set matches either form.
+    text = text.replace("đ", "d").replace("Đ", "D")
+    return "".join(
+        c
+        for c in unicodedata.normalize("NFD", text)
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+# A sign only counts when the number is followed by a currency unit, otherwise
+# dates (08-08-2026), account numbers (1234-5678) and refs match too.
+# Runs on accent-stripped lowercase text, so vnd/vnđ/đ/d all collapse to vnd|d.
+_SIGNED_AMOUNT_RE = re.compile(r"([+\-−]\s?\d[\d.,]*)\s*(?:vnd|d)\b")
+
+# Unsigned fallback: an amount right after a label or transaction verb
+# ("GD: 30,000", "bi tru 50,000VND", "nhan duoc 500,000 VND").
+_LABELED_AMOUNT_RE = re.compile(
+    r"\b(?:gd|so tien|bi tru|tru|nhan duoc|cong tien)[:\s]+([+\-−]?\d[\d.,]*)"
+)
+
+# Keyword fallback (word-bounded, on accent-stripped text). Transfer wording
+# ("chuyen den"/"chuyen khoan") is deliberately absent: it appears in both
+# sender and receiver notifications, so the LLM keeps that call.
+_INCOME_KEYWORD_RE = re.compile(r"nhan duoc|nhan tien|cong tien|ghi co|tien vao|\bcredit\b")
+_EXPENSE_KEYWORD_RE = re.compile(r"\btru\b|thanh toan|ghi no|tien ra|\bdebit\b")
+
+
+def _analyze_notification_signal(text: str) -> tuple[int | None, str | None]:
+    """Deterministic (amount, type) signals from a bank/e-wallet notification.
+
+    The signed amount is the single source of truth for both fields so they can
+    never disagree. Either value is None when the text carries no reliable
+    signal — the LLM's answer is kept in that case.
+    """
     if not text:
-        return None
+        return None, None
 
-    lower = text.lower()
+    normalized = _strip_accents(text.lower())
 
-    # ✅ dấu - => EXPENSE
-    if re.search(r"[-−]\s?\d", text):
-        return "EXPENSE"
+    match = _SIGNED_AMOUNT_RE.search(normalized)
+    if match:
+        raw = match.group(1)
+        digits = re.sub(r"[^\d]", "", raw)
+        if digits:
+            tx_type = "INCOME" if raw.startswith("+") else "EXPENSE"
+            return int(digits), tx_type
 
-    # ✅ từ khóa income
-    if any(kw in lower for kw in ["nhận", "chuyển đến", "cộng tiền", "credit", "ghi có"]):
-        return "INCOME"
+    amount: int | None = None
+    match = _LABELED_AMOUNT_RE.search(normalized)
+    if match:
+        digits = re.sub(r"[^\d]", "", match.group(1))
+        if digits:
+            amount = int(digits)
 
-    # ✅ từ khóa expense
-    if any(kw in lower for kw in ["trừ", "thanh toán", "chi", "debit", "ghi nợ"]):
-        return "EXPENSE"
+    if _INCOME_KEYWORD_RE.search(normalized):
+        return amount, "INCOME"
+    if _EXPENSE_KEYWORD_RE.search(normalized):
+        return amount, "EXPENSE"
 
-    return None
+    return amount, None
 
 
 def _parse_job(fields: dict[str, str]) -> JobEvent | None:
@@ -470,38 +514,6 @@ async def _handle_financial_assistant_duty(
         provider="openai",
     )
 
-def _extract_amount_from_notification(text: str) -> int | None:
-    if not text:
-        return None
-
-    normalized = text.lower()
-
-    # 🔥 STEP 1: ưu tiên số có dấu (transaction thật)
-    signed_pattern = r"([+-]\d[\d.,]*)\s*(?:vnd|vnđ|đ)\b"
-    match = re.search(signed_pattern, normalized)
-
-    if match:
-        raw = match.group(1)
-        sign = -1 if raw.startswith("-") else 1
-        digits = re.sub(r"[^\d]", "", raw)
-
-        if digits:
-            return int(digits) * sign
-
-    # 🔥 STEP 2: fallback (nếu không có dấu)
-    fallback_patterns = [
-        r"(?:gd|so tien|số tiền)[:\s]+([+-]?\d[\d.,]*)",
-    ]
-
-    for pattern in fallback_patterns:
-        match = re.search(pattern, normalized)
-        if match:
-            digits = re.sub(r"[^\d]", "", match.group(1))
-            if digits:
-                return int(digits)
-
-    return None
-
 async def _process_financial_assistant(
     input_redis,
     result_redis,
@@ -688,10 +700,9 @@ async def _process_one(
       # regex/rule only find ONE amount — so apply them as an override only when the
       # LLM also sees a single transaction (the normal case for an alert).
       if len(transactions) == 1:
-          regex_expense = _extract_amount_from_notification(extracted_text)
-          if regex_expense is not None:
-              transactions[0]["expense"] = abs(regex_expense) or _DEFAULT_EXPENSE_VND
-          rule_type = _detect_transaction_type_rule(extracted_text)
+          rule_amount, rule_type = _analyze_notification_signal(extracted_text)
+          if rule_amount is not None:
+              transactions[0]["expense"] = rule_amount or _DEFAULT_EXPENSE_VND
           if rule_type:
               transactions[0]["type"] = rule_type
 
